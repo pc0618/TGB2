@@ -392,8 +392,19 @@ wandb_config = {
     "test_events": test_events,
     "num_nodes": dataset.num_nodes,
     "num_edges": dataset.num_edges,
+    "num_neighbors": NUM_NEIGHBORS,
+    "gnn_layers": 1,
 }
-run_name = args.wandb_run_name or f"{MODEL_NAME}_{DATA}_{aggregator_name}_{int(time.time())}"
+if args.wandb_run_name:
+    run_name = args.wandb_run_name
+else:
+    sanitized_lr = f"{LR:.1e}".replace("+", "").replace("-", "m").replace(".", "p")
+    run_name = (
+        f"{MODEL_NAME}_{DATA}_aggr-{aggregator_name}"
+        f"_bs{BATCH_SIZE}_lr{sanitized_lr}_mem{MEM_DIM}_time{TIME_DIM}"
+        f"_emb{EMB_DIM}_neigh{NUM_NEIGHBORS}_layers1_epochs{NUM_EPOCH}"
+    )
+    run_name = run_name.replace("__", "_")
 init_wandb(args, run_name, wandb_config)
 
 train_loader = TemporalDataLoader(train_data, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS)

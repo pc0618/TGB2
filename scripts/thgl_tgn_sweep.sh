@@ -22,7 +22,8 @@ EXTRA_ARGS=${EXTRA_ARGS:-}
 for aggr in ${AGGRS}; do
   for lr in ${LR_VALUES}; do
     safe_lr=${lr//./p}
-    run_name="${RUN_PREFIX}_${aggr}_lr_${safe_lr}"
+    safe_lr=${safe_lr//-/m}
+    run_name="${RUN_PREFIX}_${aggr}_bs${BATCH_SIZE}_lr_${safe_lr}_mem${MEM_DIM}_time${TIME_DIM}_emb${EMB_DIM}_nw${NUM_WORKERS}_epochs${EPOCHS}"
     echo "[INFO] Launching run ${run_name} (aggr=${aggr}, lr=${lr})"
     PYTHONPATH=. "${PYTHON_BIN}" examples/linkproppred/thgl-forum/tgn.py \
       --data "${DATASET}" \
