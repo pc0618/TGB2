@@ -39,6 +39,7 @@ for aggr in ${AGGRS}; do
       --aggr "${aggr}" \
       --edge_emb_dim "${EDGE_EMB_DIM}" \
       --num_workers "${NUM_WORKERS}" \
+      --num_neg_samples "${NUM_NEG_SAMPLES:-1}" \
       --wandb \
       --wandb_project "${WANDB_PROJECT}" \
       --wandb_entity "${WANDB_ENTITY}" \

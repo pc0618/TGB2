@@ -125,16 +125,21 @@ def train(epoch_idx: int):
 
         src, pos_dst, t, msg, rel = batch.src, batch.dst, batch.t, batch.msg, batch.edge_type
 
-        # Sample negative destination nodes.
+        num_pos = src.size(0)
         neg_dst = torch.randint(
             min_dst_idx,
             max_dst_idx + 1,
-            (src.size(0),),
+            (num_pos * TRAIN_NEG_SAMPLES,),
             dtype=torch.long,
             device=device,
         )
+        neg_dst = neg_dst.view(TRAIN_NEG_SAMPLES, num_pos)
 
-        n_id = torch.cat([src, pos_dst, neg_dst]).unique()
+        expanded_src = src.unsqueeze(0).expand(TRAIN_NEG_SAMPLES, -1)
+        neg_src = expanded_src.reshape(-1)
+        flat_neg_dst = neg_dst.reshape(-1)
+
+        n_id = torch.cat([src, pos_dst, flat_neg_dst]).unique()
         n_id, edge_index, e_id = neighbor_loader(n_id)
         assoc[n_id] = torch.arange(n_id.size(0), device=device)
 
@@ -149,7 +154,9 @@ def train(epoch_idx: int):
         )
 
         pos_out = model['link_pred'](z[assoc[src]], z[assoc[pos_dst]])
-        neg_out = model['link_pred'](z[assoc[src]], z[assoc[neg_dst]])
+        neg_out = model['link_pred'](z[assoc[neg_src]], z[assoc[flat_neg_dst]])
+        neg_out = neg_out.view(TRAIN_NEG_SAMPLES, num_pos, -1)
+        neg_out = neg_out.mean(dim=0)
 
         loss = criterion(pos_out, torch.ones_like(pos_out))
         loss += criterion(neg_out, torch.zeros_like(neg_out))
@@ -306,6 +313,7 @@ NUM_RUNS = args.num_run
 NUM_NEIGHBORS = 10
 USE_EDGE_TYPE = True
 USE_NODE_TYPE = True
+TRAIN_NEG_SAMPLES = max(1, args.num_neg_samples)
 CHECKPOINT_EVERY = max(0, args.checkpoint_every)
 
 
