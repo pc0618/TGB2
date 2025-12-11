@@ -395,23 +395,6 @@ wandb_config = {
 run_name = args.wandb_run_name or f"{MODEL_NAME}_{DATA}_{aggregator_name}_{int(time.time())}"
 init_wandb(args, run_name, wandb_config)
 
-log_dir = Path(results_path) / "training_logs"
-log_dir.mkdir(parents=True, exist_ok=True)
-metrics_log_path = log_dir / f"{run_name}_metrics.log"
-if not metrics_log_path.exists():
-    with metrics_log_path.open("w", encoding="utf-8") as fh:
-        fh.write(f"# Run: {run_name}\n")
-        fh.write(f"# Dataset: {DATA}\n")
-        fh.write(f"# Aggregator: {aggregator_name}\n")
-        fh.write("# timestamp | section | epoch | metric | value\n")
-
-def append_metric_log(section: str, epoch_value: float, metric_name: str, metric_value: float) -> None:
-    timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-    with metrics_log_path.open("a", encoding="utf-8") as fh:
-        fh.write(
-            f"{timestamp} | {section} | {epoch_value:.2f} | {metric_name} | {float(metric_value):.6f}\n"
-        )
-
 train_loader = TemporalDataLoader(train_data, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS)
 val_loader = TemporalDataLoader(val_data, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS)
 test_loader = TemporalDataLoader(test_data, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS)
@@ -446,6 +429,23 @@ if not osp.exists(results_path):
     print('INFO: Create directory {}'.format(results_path))
 Path(results_path).mkdir(parents=True, exist_ok=True)
 results_filename = f'{results_path}/{MODEL_NAME}_{DATA}_results.json'
+
+log_dir = Path(results_path) / "training_logs"
+log_dir.mkdir(parents=True, exist_ok=True)
+metrics_log_path = log_dir / f"{run_name}_metrics.log"
+if not metrics_log_path.exists():
+    with metrics_log_path.open("w", encoding="utf-8") as fh:
+        fh.write(f"# Run: {run_name}\n")
+        fh.write(f"# Dataset: {DATA}\n")
+        fh.write(f"# Aggregator: {aggregator_name}\n")
+        fh.write("# timestamp | section | epoch | metric | value\n")
+
+def append_metric_log(section: str, epoch_value: float, metric_name: str, metric_value: float) -> None:
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    with metrics_log_path.open("a", encoding="utf-8") as fh:
+        fh.write(
+            f"{timestamp} | {section} | {epoch_value:.2f} | {metric_name} | {float(metric_value):.6f}\n"
+        )
 
 for run_idx in range(NUM_RUNS):
     print('-------------------------------------------------------------------------------')
