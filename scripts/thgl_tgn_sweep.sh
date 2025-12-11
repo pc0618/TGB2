@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PYTHON_BIN=${PYTHON_BIN:-~/relbench/.venv/bin/python}
+DATASET=${DATASET:-thgl-software}
+EPOCHS=${EPOCHS:-50}
+BATCH_SIZE=${BATCH_SIZE:-256}
+MEM_DIM=${MEM_DIM:-128}
+TIME_DIM=${TIME_DIM:-128}
+EMB_DIM=${EMB_DIM:-128}
+LR_VALUES=${LR_VALUES:-"2e-4 5e-4"}
+AGGRS=${AGGRS:-"sum mean max"}
+PATIENCE=${PATIENCE:-2}
+EDGE_EMB_DIM=${EDGE_EMB_DIM:-128}
+WANDB_PROJECT=${WANDB_PROJECT:-tgb-thgl}
+WANDB_ENTITY=${WANDB_ENTITY:-marin-community}
+WANDB_GROUP=${WANDB_GROUP:-thgl-tgn}
+RUN_PREFIX=${RUN_PREFIX:-tgn_thgl}
+NUM_WORKERS=${NUM_WORKERS:-22}
+EXTRA_ARGS=${EXTRA_ARGS:-}
+
+for aggr in ${AGGRS}; do
+  for lr in ${LR_VALUES}; do
+    safe_lr=${lr//./p}
+    run_name="${RUN_PREFIX}_${aggr}_lr_${safe_lr}"
+    echo "[INFO] Launching run ${run_name} (aggr=${aggr}, lr=${lr})"
+    PYTHONPATH=. "${PYTHON_BIN}" examples/linkproppred/thgl-forum/tgn.py \
+      --data "${DATASET}" \
+      --num_epoch "${EPOCHS}" \
+      --num_run 1 \
+      --bs "${BATCH_SIZE}" \
+      --mem_dim "${MEM_DIM}" \
+      --time_dim "${TIME_DIM}" \
+      --emb_dim "${EMB_DIM}" \
+      --lr "${lr}" \
+      --patience "${PATIENCE}" \
+      --split_frac 1.0 \
+      --aggr "${aggr}" \
+      --edge_emb_dim "${EDGE_EMB_DIM}" \
+      --num_workers "${NUM_WORKERS}" \
+      --wandb \
+      --wandb_project "${WANDB_PROJECT}" \
+      --wandb_entity "${WANDB_ENTITY}" \
+      --wandb_group "${WANDB_GROUP}" \
+      --wandb_run_name "${run_name}" \
+      ${EXTRA_ARGS}
+  done
+done

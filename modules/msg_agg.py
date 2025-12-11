@@ -24,3 +24,13 @@ class LastAggregator(torch.nn.Module):
 class MeanAggregator(torch.nn.Module):
     def forward(self, msg: Tensor, index: Tensor, t: Tensor, dim_size: int):
         return scatter(msg, index, dim=0, dim_size=dim_size, reduce="mean")
+
+
+class SumAggregator(torch.nn.Module):
+    def forward(self, msg: Tensor, index: Tensor, t: Tensor, dim_size: int):
+        return scatter(msg, index, dim=0, dim_size=dim_size, reduce="sum")
+
+
+class MaxAggregator(torch.nn.Module):
+    def forward(self, msg: Tensor, index: Tensor, t: Tensor, dim_size: int):
+        return scatter(msg, index, dim=0, dim_size=dim_size, reduce="max")

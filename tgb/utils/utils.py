@@ -151,6 +151,16 @@ def get_args():
     parser.add_argument('--tolerance', type=float, help='Early stopper tolerance', default=1e-6)
     parser.add_argument('--patience', type=float, help='Early stopper patience', default=5)
     parser.add_argument('--num_run', type=int, help='Number of iteration runs', default=5)
+    parser.add_argument('--split_frac', type=float, help='Fraction of each split to keep (0 < frac <= 1)', default=1.0)
+    parser.add_argument('--aggr', type=str, help='Temporal message aggregator', choices=['last', 'mean', 'sum', 'max'], default='last')
+    parser.add_argument('--edge_emb_dim', type=int, help='Edge type embedding dimension', default=64)
+    parser.add_argument('--wandb', action='store_true', help='Enable Weights & Biases logging')
+    parser.add_argument('--wandb_project', type=str, help='Weights & Biases project name', default='tgb-link')
+    parser.add_argument('--wandb_entity', type=str, help='Weights & Biases entity', default=None)
+    parser.add_argument('--wandb_group', type=str, help='Weights & Biases group label', default=None)
+    parser.add_argument('--wandb_run_name', type=str, help='Weights & Biases run name override', default=None)
+    parser.add_argument('--log_every', type=int, help='Log training/eval batch progress every N batches (0 to disable)', default=100)
+    parser.add_argument('--num_workers', type=int, help='Number of TemporalDataLoader worker processes', default=0)
 
     try:
         args = parser.parse_args()
