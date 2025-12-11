@@ -1,5 +1,7 @@
 import numpy as np
 from tgb.linkproppred.dataset_pyg import PyGLinkPropPredDataset
+from tgb.datasets.thgl_schema import convert_temporal_data_variant
+from tgb.datasets.thgl_features import add_temporal_features, FEATURE_VERSION
 from tgb.linkproppred.evaluate import Evaluator
 from torch_geometric.loader import TemporalDataLoader
 from tqdm import tqdm
@@ -33,8 +35,6 @@ from modules.msg_agg import LastAggregator, MeanAggregator, SumAggregator, MaxAg
 from modules.neighbor_loader import LastNeighborLoader
 from modules.memory_module import TGNMemory
 from modules.early_stopping import  EarlyStopMonitor
-from tgb.linkproppred.dataset_pyg import PyGLinkPropPredDataset
-from tgb.datasets.thgl_schema import convert_temporal_data_variant
 
 AGGREGATOR_REGISTRY = {
     "last": LastAggregator,
@@ -87,24 +87,22 @@ def log_to_wandb(payload: dict):
 
 
 def load_temporal_data_with_schema(dataset, args, device):
-    base_data = dataset.get_TemporalData()
-    if args.schema_variant == "default18":
-        print("INFO: Using default 18-relation schema.")
-        return base_data.to(device)
-
-    cache_root = Path(args.schema_cache_dir) if args.schema_cache_dir else Path(dataset.root) / "schema_cache"
+    cache_root = Path(args.schema_cache_dir) if args.schema_cache_dir else Path(dataset.root) / "schema_cache_augmented"
     cache_root.mkdir(parents=True, exist_ok=True)
-    cache_file = cache_root / f"{args.data}_{args.schema_variant}.pt"
+    cache_file = cache_root / f"{args.data}_{args.schema_variant}_{FEATURE_VERSION}.pt"
 
     if cache_file.exists():
-        print(f"INFO: Loading cached schema variant from {cache_file}")
-        schema_data = torch.load(cache_file)
-    else:
-        print(f"INFO: Building schema variant '{args.schema_variant}' cache at {cache_file}")
-        schema_data = convert_temporal_data_variant(base_data.cpu(), args.schema_variant)
-        torch.save(schema_data, cache_file)
+        print(f"INFO: Loading cached schema+feature data from {cache_file}")
+        cached = torch.load(cache_file)
+        return cached.to(device)
 
-    return schema_data.to(device)
+    print(f"INFO: Building schema variant '{args.schema_variant}' with features ({FEATURE_VERSION})")
+    data_cpu = dataset.get_TemporalData().cpu()
+    if args.schema_variant != "default18":
+        data_cpu = convert_temporal_data_variant(data_cpu, args.schema_variant)
+    data_cpu = add_temporal_features(data_cpu, dataset.num_nodes)
+    torch.save(data_cpu, cache_file)
+    return data_cpu.to(device)
 
 
 def _truncate_split(split_data, fraction, split_name):
@@ -429,6 +427,7 @@ wandb_config = {
     "num_edges": dataset.num_edges,
     "num_neg_samples": TRAIN_NEG_SAMPLES,
     "schema_variant": args.schema_variant,
+    "feature_set": FEATURE_VERSION,
     "gnn_layers": 1,
 }
 if args.wandb_run_name:
@@ -439,7 +438,7 @@ else:
         f"{MODEL_NAME}_{DATA}_aggr-{aggregator_name}"
         f"_bs{BATCH_SIZE}_lr{lr_token}_mem{MEM_DIM}_time{TIME_DIM}"
         f"_emb{EMB_DIM}_neigh{NUM_NEIGHBORS}_layers1_epochs{NUM_EPOCH}"
-        f"_neg{TRAIN_NEG_SAMPLES}_schema{args.schema_variant}"
+        f"_neg{TRAIN_NEG_SAMPLES}_schema{args.schema_variant}_feat{FEATURE_VERSION}"
     ).replace("__", "_")
 init_wandb(args, run_name, wandb_config)
 
