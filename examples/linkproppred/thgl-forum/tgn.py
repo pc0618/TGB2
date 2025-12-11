@@ -306,6 +306,7 @@ NUM_RUNS = args.num_run
 NUM_NEIGHBORS = 10
 USE_EDGE_TYPE = True
 USE_NODE_TYPE = True
+CHECKPOINT_EVERY = max(0, args.checkpoint_every)
 
 
 
@@ -440,12 +441,31 @@ if not metrics_log_path.exists():
         fh.write(f"# Aggregator: {aggregator_name}\n")
         fh.write("# timestamp | section | epoch | metric | value\n")
 
+checkpoint_dir = Path(args.checkpoint_dir) if args.checkpoint_dir else (Path(results_path) / "checkpoints")
+checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
 def append_metric_log(section: str, epoch_value: float, metric_name: str, metric_value: float) -> None:
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
     with metrics_log_path.open("a", encoding="utf-8") as fh:
         fh.write(
             f"{timestamp} | {section} | {epoch_value:.2f} | {metric_name} | {float(metric_value):.6f}\n"
         )
+
+def save_periodic_checkpoint(epoch_value: int, run_index: int, model_dict: dict, optimizer_obj) -> None:
+    if CHECKPOINT_EVERY <= 0:
+        return
+    if epoch_value % CHECKPOINT_EVERY != 0:
+        return
+    checkpoint_payload = {
+        "epoch": epoch_value,
+        "run_idx": run_index,
+        "model_state": {name: module.state_dict() for name, module in model_dict.items()},
+        "optimizer_state": optimizer_obj.state_dict(),
+        "args": vars(args),
+    }
+    ckpt_path = checkpoint_dir / f"{run_name}_run{run_index}_epoch{epoch_value:03d}.pth"
+    torch.save(checkpoint_payload, ckpt_path)
+    print(f"INFO: Saved periodic checkpoint to {ckpt_path}")
 
 for run_idx in range(NUM_RUNS):
     print('-------------------------------------------------------------------------------')
@@ -531,6 +551,8 @@ for run_idx in range(NUM_RUNS):
         log_to_wandb(val_payload)
         append_metric_log("val", epoch, metric, perf_metric_val)
         val_perf_list.append(perf_metric_val)
+
+        save_periodic_checkpoint(epoch, run_idx, model, optimizer)
 
         # check for early stopping
         if early_stopper.step_check(perf_metric_val, model):
