@@ -34,6 +34,7 @@ from modules.neighbor_loader import LastNeighborLoader
 from modules.memory_module import TGNMemory
 from modules.early_stopping import  EarlyStopMonitor
 from tgb.linkproppred.dataset_pyg import PyGLinkPropPredDataset
+from tgb.datasets.thgl_schema import convert_temporal_data_variant
 
 AGGREGATOR_REGISTRY = {
     "last": LastAggregator,
@@ -83,6 +84,27 @@ def log_to_wandb(payload: dict):
         return
     wandb_module.log(payload, step=wandb_step_counter)
     wandb_step_counter += 1
+
+
+def load_temporal_data_with_schema(dataset, args, device):
+    base_data = dataset.get_TemporalData()
+    if args.schema_variant == "default18":
+        print("INFO: Using default 18-relation schema.")
+        return base_data.to(device)
+
+    cache_root = Path(args.schema_cache_dir) if args.schema_cache_dir else Path(dataset.root) / "schema_cache"
+    cache_root.mkdir(parents=True, exist_ok=True)
+    cache_file = cache_root / f"{args.data}_{args.schema_variant}.pt"
+
+    if cache_file.exists():
+        print(f"INFO: Loading cached schema variant from {cache_file}")
+        schema_data = torch.load(cache_file)
+    else:
+        print(f"INFO: Building schema variant '{args.schema_variant}' cache at {cache_file}")
+        schema_data = convert_temporal_data_variant(base_data.cpu(), args.schema_variant)
+        torch.save(schema_data, cache_file)
+
+    return schema_data.to(device)
 
 
 def _truncate_split(split_data, fraction, split_name):
@@ -315,6 +337,7 @@ USE_EDGE_TYPE = True
 USE_NODE_TYPE = True
 TRAIN_NEG_SAMPLES = max(1, args.num_neg_samples)
 CHECKPOINT_EVERY = max(0, args.checkpoint_every)
+print(f"INFO: Training with {TRAIN_NEG_SAMPLES} negative samples per positive edge")
 
 
 
@@ -330,12 +353,16 @@ dataset = PyGLinkPropPredDataset(name=DATA, root="datasets")
 train_mask = dataset.train_mask
 val_mask = dataset.val_mask
 test_mask = dataset.test_mask
-data = dataset.get_TemporalData()
-data = data.to(device)
+data = load_temporal_data_with_schema(dataset, args, device)
 metric = dataset.eval_metric
 
 print ("there are {} nodes and {} edges".format(dataset.num_nodes, dataset.num_edges))
-print ("there are {} relation types".format(dataset.num_rels))
+print(f"INFO: Schema variant = {args.schema_variant}")
+if args.schema_variant == "default18":
+    print ("there are {} relation types".format(dataset.num_rels))
+else:
+    variant_rels = int(data.edge_type.max().item() + 1)
+    print(f"there are {variant_rels} aggregated relation types (original {dataset.num_rels})")
 
 
 timestamp = data.t
@@ -400,19 +427,20 @@ wandb_config = {
     "test_events": test_events,
     "num_nodes": dataset.num_nodes,
     "num_edges": dataset.num_edges,
-    "num_neighbors": NUM_NEIGHBORS,
+    "num_neg_samples": TRAIN_NEG_SAMPLES,
+    "schema_variant": args.schema_variant,
     "gnn_layers": 1,
 }
 if args.wandb_run_name:
     run_name = args.wandb_run_name
 else:
-    sanitized_lr = f"{LR:.1e}".replace("+", "").replace("-", "m").replace(".", "p")
+    lr_token = f"{LR:.1e}".replace("+", "").replace("-", "m").replace(".", "p")
     run_name = (
         f"{MODEL_NAME}_{DATA}_aggr-{aggregator_name}"
-        f"_bs{BATCH_SIZE}_lr{sanitized_lr}_mem{MEM_DIM}_time{TIME_DIM}"
+        f"_bs{BATCH_SIZE}_lr{lr_token}_mem{MEM_DIM}_time{TIME_DIM}"
         f"_emb{EMB_DIM}_neigh{NUM_NEIGHBORS}_layers1_epochs{NUM_EPOCH}"
-    )
-    run_name = run_name.replace("__", "_")
+        f"_neg{TRAIN_NEG_SAMPLES}_schema{args.schema_variant}"
+    ).replace("__", "_")
 init_wandb(args, run_name, wandb_config)
 
 train_loader = TemporalDataLoader(train_data, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS)

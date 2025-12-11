@@ -17,13 +17,21 @@ WANDB_ENTITY=${WANDB_ENTITY:-marin-community}
 WANDB_GROUP=${WANDB_GROUP:-thgl-tgn}
 RUN_PREFIX=${RUN_PREFIX:-tgn_thgl}
 NUM_WORKERS=${NUM_WORKERS:-22}
+NUM_NEG_SAMPLES=${NUM_NEG_SAMPLES:-1}
+SCHEMA_VARIANT=${SCHEMA_VARIANT:-default18}
+SCHEMA_CACHE_DIR=${SCHEMA_CACHE_DIR:-}
 EXTRA_ARGS=${EXTRA_ARGS:-}
+
+extra_cache_args=()
+if [[ -n "${SCHEMA_CACHE_DIR}" ]]; then
+  extra_cache_args+=(--schema_cache_dir "${SCHEMA_CACHE_DIR}")
+fi
 
 for aggr in ${AGGRS}; do
   for lr in ${LR_VALUES}; do
     safe_lr=${lr//./p}
     safe_lr=${safe_lr//-/m}
-    run_name="${RUN_PREFIX}_${aggr}_bs${BATCH_SIZE}_lr_${safe_lr}_mem${MEM_DIM}_time${TIME_DIM}_emb${EMB_DIM}_nw${NUM_WORKERS}_epochs${EPOCHS}"
+    run_name="${RUN_PREFIX}_${aggr}_bs${BATCH_SIZE}_lr_${safe_lr}_mem${MEM_DIM}_time${TIME_DIM}_emb${EMB_DIM}_nw${NUM_WORKERS}_epochs${EPOCHS}_neg${NUM_NEG_SAMPLES}_schema${SCHEMA_VARIANT}"
     echo "[INFO] Launching run ${run_name} (aggr=${aggr}, lr=${lr})"
     PYTHONPATH=. "${PYTHON_BIN}" examples/linkproppred/thgl-forum/tgn.py \
       --data "${DATASET}" \
@@ -39,7 +47,9 @@ for aggr in ${AGGRS}; do
       --aggr "${aggr}" \
       --edge_emb_dim "${EDGE_EMB_DIM}" \
       --num_workers "${NUM_WORKERS}" \
-      --num_neg_samples "${NUM_NEG_SAMPLES:-1}" \
+      --num_neg_samples "${NUM_NEG_SAMPLES}" \
+      --schema_variant "${SCHEMA_VARIANT}" \
+      "${extra_cache_args[@]}" \
       --wandb \
       --wandb_project "${WANDB_PROJECT}" \
       --wandb_entity "${WANDB_ENTITY}" \

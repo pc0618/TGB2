@@ -162,6 +162,8 @@ def get_args():
     parser.add_argument('--log_every', type=int, help='Log training/eval batch progress every N batches (0 to disable)', default=100)
     parser.add_argument('--num_workers', type=int, help='Number of TemporalDataLoader worker processes', default=0)
     parser.add_argument('--num_neg_samples', type=int, help='Negative samples per positive edge during training', default=1)
+    parser.add_argument('--schema_variant', type=str, choices=['default18', 'agg10'], default='default18', help='Temporal schema projection to use')
+    parser.add_argument('--schema_cache_dir', type=str, help='Optional cache dir for schema-converted datasets', default=None)
     parser.add_argument('--checkpoint_every', type=int, help='Save model checkpoint every N epochs (0 disables)', default=0)
     parser.add_argument('--checkpoint_dir', type=str, help='Directory for periodic checkpoints (defaults to saved_results/checkpoints)', default=None)
 

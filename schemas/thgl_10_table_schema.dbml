@@ -1,0 +1,90 @@
+////////////////////////////////////////////////////////////
+// Entity tables
+////////////////////////////////////////////////////////////
+Table users {
+  user_id bigint [pk]
+  login text
+  created_ts bigint
+}
+
+Table issues {
+  issue_id bigint [pk]
+  repo_id bigint [ref: > repos.repo_id]
+  opened_ts bigint
+}
+
+Table pull_requests {
+  pr_id bigint [pk]
+  repo_id bigint [ref: > repos.repo_id]
+  opened_ts bigint
+}
+
+Table repos {
+  repo_id bigint [pk]
+  owner_user_id bigint [ref: > users.user_id]
+  created_ts bigint
+}
+
+////////////////////////////////////////////////////////////
+// Aggregated relation tables by entity pair
+////////////////////////////////////////////////////////////
+Table user_issue_events {
+  user_id bigint [ref: > users.user_id]
+  issue_id bigint [ref: > issues.issue_id]
+  event_ts bigint
+  event_type text // opened | closed | reopened
+  indexes {
+    (user_id, issue_id, event_ts, event_type) [pk]
+  }
+}
+
+Table issue_repo_events {
+  issue_id bigint [ref: > issues.issue_id]
+  repo_id bigint [ref: > repos.repo_id]
+  event_ts bigint
+  event_type text // opened | closed | reopened
+  indexes {
+    (issue_id, repo_id, event_ts, event_type) [pk]
+  }
+}
+
+Table user_pr_events {
+  user_id bigint [ref: > users.user_id]
+  pr_id bigint [ref: > pull_requests.pr_id]
+  event_ts bigint
+  event_type text // opened | closed | reopened
+  indexes {
+    (user_id, pr_id, event_ts, event_type) [pk]
+  }
+}
+
+Table pr_repo_events {
+  pr_id bigint [ref: > pull_requests.pr_id]
+  repo_id bigint [ref: > repos.repo_id]
+  event_ts bigint
+  event_type text // opened | closed | reopened
+  indexes {
+    (pr_id, repo_id, event_ts, event_type) [pk]
+  }
+}
+
+Table user_repo_events {
+  user_id bigint [ref: > users.user_id]
+  repo_id bigint [ref: > repos.repo_id]
+  event_ts bigint
+  event_type text // added_collaborator
+  role text
+  indexes {
+    (user_id, repo_id, event_ts, event_type) [pk]
+  }
+}
+
+Table repo_repo_events {
+  child_repo_id bigint [ref: > repos.repo_id]
+  parent_repo_id bigint [ref: > repos.repo_id]
+  event_ts bigint
+  event_type text // forked_from
+  indexes {
+    (child_repo_id, parent_repo_id, event_ts, event_type) [pk]
+  }
+}
