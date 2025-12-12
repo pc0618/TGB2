@@ -1,0 +1,171 @@
+////////////////////////////////////////////////////////////
+// Entity tables
+////////////////////////////////////////////////////////////
+Table users {
+  user_id bigint [pk]
+  login text
+  created_ts bigint
+}
+
+Table issues {
+  issue_id bigint [pk]
+  repo_id bigint [ref: > repos.repo_id]
+  opened_ts bigint
+}
+
+Table pull_requests {
+  pr_id bigint [pk]
+  repo_id bigint [ref: > repos.repo_id]
+  opened_ts bigint
+}
+
+Table repos {
+  repo_id bigint [pk]
+  owner_user_id bigint [ref: > users.user_id]
+  created_ts bigint
+}
+
+////////////////////////////////////////////////////////////
+// Relation tables (one per edge type)
+////////////////////////////////////////////////////////////
+Table user_opened_issue { // U_SE_O_I
+  user_id bigint [ref: > users.user_id]
+  issue_id bigint [ref: > issues.issue_id]
+  event_ts bigint
+  event_type text [default: 'opened']
+  indexes {
+    (user_id, issue_id, event_ts, event_type) [pk]
+  }
+}
+
+Table user_closed_issue { // U_SE_C_I
+  user_id bigint [ref: > users.user_id]
+  issue_id bigint [ref: > issues.issue_id]
+  event_ts bigint
+  event_type text [default: 'closed']
+  indexes {
+    (user_id, issue_id, event_ts, event_type) [pk]
+  }
+}
+
+Table user_reopened_issue { // U_SE_RO_I
+  user_id bigint [ref: > users.user_id]
+  issue_id bigint [ref: > issues.issue_id]
+  event_ts bigint
+  event_type text [default: 'reopened']
+  indexes {
+    (user_id, issue_id, event_ts, event_type) [pk]
+  }
+}
+
+Table issue_opened_repo { // I_AO_O_R
+  issue_id bigint [ref: > issues.issue_id]
+  repo_id bigint [ref: > repos.repo_id]
+  event_ts bigint
+  event_type text [default: 'opened']
+  indexes {
+    (issue_id, repo_id, event_ts, event_type) [pk]
+  }
+}
+
+Table issue_closed_repo { // I_AO_C_R
+  issue_id bigint [ref: > issues.issue_id]
+  repo_id bigint [ref: > repos.repo_id]
+  event_ts bigint
+  event_type text [default: 'closed']
+  indexes {
+    (issue_id, repo_id, event_ts, event_type) [pk]
+  }
+}
+
+Table issue_reopened_repo { // I_AO_RO_R
+  issue_id bigint [ref: > issues.issue_id]
+  repo_id bigint [ref: > repos.repo_id]
+  event_ts bigint
+  event_type text [default: 'reopened']
+  indexes {
+    (issue_id, repo_id, event_ts, event_type) [pk]
+  }
+}
+
+Table user_opened_pr { // U_SO_O_P
+  user_id bigint [ref: > users.user_id]
+  pr_id bigint [ref: > pull_requests.pr_id]
+  event_ts bigint
+  event_type text [default: 'opened']
+  indexes {
+    (user_id, pr_id, event_ts, event_type) [pk]
+  }
+}
+
+Table user_closed_pr { // U_SO_C_P
+  user_id bigint [ref: > users.user_id]
+  pr_id bigint [ref: > pull_requests.pr_id]
+  event_ts bigint
+  event_type text [default: 'closed']
+  indexes {
+    (user_id, pr_id, event_ts, event_type) [pk]
+  }
+}
+
+Table user_reopened_pr { // U_SO_R_P
+  user_id bigint [ref: > users.user_id]
+  pr_id bigint [ref: > pull_requests.pr_id]
+  event_ts bigint
+  event_type text [default: 'reopened']
+  indexes {
+    (user_id, pr_id, event_ts, event_type) [pk]
+  }
+}
+
+Table pr_opened_repo { // P_AO_O_R
+  pr_id bigint [ref: > pull_requests.pr_id]
+  repo_id bigint [ref: > repos.repo_id]
+  event_ts bigint
+  event_type text [default: 'opened']
+  indexes {
+    (pr_id, repo_id, event_ts, event_type) [pk]
+  }
+}
+
+Table pr_closed_repo { // P_AO_C_R
+  pr_id bigint [ref: > pull_requests.pr_id]
+  repo_id bigint [ref: > repos.repo_id]
+  event_ts bigint
+  event_type text [default: 'closed']
+  indexes {
+    (pr_id, repo_id, event_ts, event_type) [pk]
+  }
+}
+
+Table pr_reopened_repo { // P_AO_R_R
+  pr_id bigint [ref: > pull_requests.pr_id]
+  repo_id bigint [ref: > repos.repo_id]
+  event_ts bigint
+  event_type text [default: 'reopened']
+  indexes {
+    (pr_id, repo_id, event_ts, event_type) [pk]
+  }
+}
+
+Table user_added_to_repo { // U_CO_A_R
+  user_id bigint [ref: > users.user_id]
+  repo_id bigint [ref: > repos.repo_id]
+  event_ts bigint
+  event_type text [default: 'added_collaborator']
+  role text
+  indexes {
+    (user_id, repo_id, event_ts, event_type) [pk]
+  }
+}
+
+Table repo_forked_repo { // R_FO_R
+  child_repo_id bigint [ref: > repos.repo_id]
+  parent_repo_id bigint [ref: > repos.repo_id]
+  event_ts bigint
+  event_type text [default: 'forked_from']
+  indexes {
+    (child_repo_id, parent_repo_id, event_ts, event_type) [pk]
+  }
+}
+

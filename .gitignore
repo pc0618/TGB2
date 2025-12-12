@@ -1,5 +1,7 @@
 !requirements*.txt
 get_croissant.py
+Agents.md
+agents.md
 #dataset
 stats_figures/
 figs/
@@ -35,6 +37,8 @@ software/
 saved_models/
 dump/
 saved_results/
+wandb/
+examples/linkproppred/thgl-forum/saved_checkpoints/
 
 # C extensions
 *.so
