@@ -41,26 +41,22 @@ SCHEMA_VARIANTS = ("default18", "agg10")
 def convert_temporal_data_variant(data: TemporalData, variant: str) -> TemporalData:
     if variant not in SCHEMA_VARIANTS:
         raise ValueError(f"Unsupported schema variant '{variant}'")
-    if variant == "default18":
-        return data
-    return _convert_to_agg10(data)
-
-
-def _convert_to_agg10(data: TemporalData) -> TemporalData:
     converted = data.clone()
     edge_type = converted.edge_type.long()
-    new_edge_type = torch.empty_like(edge_type)
+    agg_edge_type = torch.empty_like(edge_type)
     event_feats = torch.empty((edge_type.numel(), 1), dtype=torch.float32)
 
     for original_id, (agg_name, event_name) in EDGE_ID_TO_SCHEMA.items():
         mask = edge_type == original_id
         if not torch.any(mask):
             continue
-        new_edge_type[mask] = AGGREGATED_RELATION_IDS[agg_name]
+        if variant == "agg10":
+            agg_edge_type[mask] = AGGREGATED_RELATION_IDS[agg_name]
+        else:
+            agg_edge_type[mask] = original_id
         event_feats[mask, 0] = EVENT_NAME_TO_ID[event_name]
 
-    converted.edge_type = new_edge_type
+    converted.agg_edge_type = agg_edge_type
     msg = converted.msg.float()
-    event_feats = event_feats.to(msg.device)
-    converted.msg = torch.cat([msg, event_feats], dim=1)
+    converted.msg = torch.cat([msg, event_feats.to(msg.device)], dim=1)
     return converted

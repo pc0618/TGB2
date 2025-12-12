@@ -2,12 +2,11 @@ import numpy as np
 import pandas as pd
 import torch
 
-FEATURE_VERSION = "ageact_v1"
-SEVEN_DAYS_SECONDS = 7 * 24 * 3600
+FEATURE_VERSION = "agegap_v1"
 
 
 def add_temporal_features(data: torch.Tensor, num_nodes: int) -> torch.Tensor:
-    """Append temporal age/activity features to data.msg."""
+    """Append temporal age & inter-event gap features to data.msg."""
     features = _load_or_compute_features(data, num_nodes)
     features = features.to(data.msg.device)
     if data.msg.dtype != torch.float32:
@@ -39,7 +38,7 @@ def _compute_temporal_features(data: torch.Tensor, num_nodes: int) -> torch.Tens
     df["src_age_days"] = (df["ts"] - df["src_first_ts"]) / 86400.0
     df["dst_age_days"] = (df["ts"] - df["dst_first_ts"]) / 86400.0
 
-    # Hours since previous event for src/dst
+    # Hours since previous event for src/dst (=-1 when unseen)
     df["src_hours_since_prev"] = (
         df.groupby("src")["ts_dt"]
         .diff()
@@ -55,30 +54,11 @@ def _compute_temporal_features(data: torch.Tensor, num_nodes: int) -> torch.Tens
         .fillna(-1.0)
     )
 
-    # Rolling 7-day event counts per src/dst (excluding current event)
-    src_roll = (
-        df.groupby("src")
-        .rolling(window="7D", on="ts_dt")["ts_dt"]
-        .count()
-        - 1
-    )
-    df["src_events_7d"] = src_roll.reset_index(level=0, drop=True).fillna(0.0)
-
-    dst_roll = (
-        df.groupby("dst")
-        .rolling(window="7D", on="ts_dt")["ts_dt"]
-        .count()
-        - 1
-    )
-    df["dst_events_7d"] = dst_roll.reset_index(level=0, drop=True).fillna(0.0)
-
     feature_cols = [
         "src_age_days",
         "dst_age_days",
         "src_hours_since_prev",
         "dst_hours_since_prev",
-        "src_events_7d",
-        "dst_events_7d",
     ]
     feature_array = df[feature_cols].to_numpy(dtype=np.float32)
     return torch.from_numpy(feature_array)

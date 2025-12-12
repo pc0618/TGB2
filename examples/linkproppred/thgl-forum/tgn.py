@@ -367,11 +367,12 @@ timestamp = data.t
 head = data.src
 tail = data.dst
 edge_type = data.edge_type #relation
-edge_type_dim = len(torch.unique(edge_type))
+agg_edge_type = getattr(data, "agg_edge_type", edge_type)
+edge_type_dim = len(torch.unique(agg_edge_type))
 
 embed_edge_type = torch.nn.Embedding(edge_type_dim, EDGE_EMB_DIM).to(device)
 with torch.no_grad():
-    edge_type_embeddings = embed_edge_type(edge_type)
+    edge_type_embeddings = embed_edge_type(agg_edge_type)
 
 
 if USE_EDGE_TYPE:

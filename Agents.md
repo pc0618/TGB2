@@ -9,11 +9,10 @@
   - Test events: `223,471`
 - Each event carries `src`, `dst`, timestamp `t`, relation id `edge_type`, and message vector `msg`.
 - We embed `edge_type` (128-dim) and concatenate it onto `msg`, so every TemporalData message includes relation context.
-- Additional temporal features (`ageact_v1`) are concatenated to every edge message:
-  - `src_age_days`, `dst_age_days` – days since each endpoint first appeared.
+- Additional temporal features (`agegap_v1`) are concatenated to every edge message:
+  - `src_age_days`, `dst_age_days` – days since each endpoint first appeared in the stream.
   - `src_hours_since_prev`, `dst_hours_since_prev` – hours since the node’s previous event (=-1 when none).
-  - `src_events_7d`, `dst_events_7d` – number of events for the node in the trailing 7-day window (excluding the current one).
-  These are derived directly from the chronological stream and cached inside `datasets/schema_cache_augmented/<schema>_ageact_v1.pt` for both the default 18-relation view and the aggregated 10-table view.
+  These four values are derived directly from the chronological stream and cached inside `datasets/schema_cache_augmented/<schema>_agegap_v1.pt` for both the default 18-relation view and the aggregated 10-table view.
 - Masks (`train_mask`, `val_mask`, `test_mask`) slice the TemporalData chronologically. Optional `--split_frac` down-samples each split uniformly without changing the chronological order.
 - **10-table projection (agg10)**: When `--schema_variant agg10` is selected, we map the original 14 relation types onto the 6 aggregated relation tables below while appending the event-type id to the edge message. This keeps the entity vocabulary identical but collapses redundant edges (e.g., `U_SE_O_I`, `U_SE_C_I`, `U_SE_RO_I` all live in `user_issue_events` with `event_type ∈ {opened, closed, reopened}`). The schema+feature cache lives in `datasets/schema_cache_augmented/thgl-software_agg10_ageact_v1.pt`.
   - Aggregated relation ids: `user_issue_events`, `issue_repo_events`, `user_pr_events`, `pr_repo_events`, `user_repo_events`, `repo_repo_events`.
