@@ -7,7 +7,7 @@ This repository contains the code and reproducibility assets we used to study **
 3. Train **Temporal Graph Networks (TGN)** with a single GraphAttention layer that leverage those schemas and features.
 4. Compare against a more classical **GraphSAGE-style RelBench baseline** (`gnn_recommendation.py`).
 
-The README documents the entire workflow so new contributors can rebuild the caches, launch training and sweeps, and re-run evaluation. All of the ad-hoc notes that used to live in `Agents.md` are folded into this file so you no longer need that notebook when onboarding.
+The README documents the entire workflow so new contributors can rebuild the caches, launch training and sweeps, and re-run evaluation.
 
 ---
 
