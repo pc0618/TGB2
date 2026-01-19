@@ -40,6 +40,11 @@ saved_results/
 wandb/
 examples/linkproppred/thgl-forum/saved_checkpoints/
 
+# Generated RelBench exports (large artifacts; keep out of git)
+relbench_exports/
+exports/
+datasets/
+
 # C extensions
 *.so
 
