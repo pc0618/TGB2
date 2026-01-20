@@ -91,9 +91,12 @@ def load_temporal_data_with_schema(dataset, args, device):
     cache_root.mkdir(parents=True, exist_ok=True)
     cache_file = cache_root / f"{args.data}_{args.schema_variant}_{FEATURE_VERSION}.pt"
 
+    if not str(args.data).startswith("thgl-"):
+        return dataset.get_TemporalData().to(device)
+
     if cache_file.exists():
         print(f"INFO: Loading cached schema+feature data from {cache_file}")
-        cached = torch.load(cache_file)
+        cached = torch.load(cache_file, weights_only=False)
         return cached.to(device)
 
     print(f"INFO: Building schema variant '{args.schema_variant}' with features ({FEATURE_VERSION})")
@@ -113,6 +116,18 @@ def _truncate_split(split_data, fraction, split_name):
     if keep_events >= total_events:
         return split_data
     print(f"INFO: {split_name} split truncated to {keep_events}/{total_events} events (fraction={fraction:.6f})")
+    return split_data[:keep_events]
+
+def _cap_split(split_data, max_events: int, split_name: str):
+    if split_data is None:
+        return split_data
+    if not max_events or max_events <= 0:
+        return split_data
+    total_events = int(split_data.num_events)
+    keep_events = min(int(max_events), total_events)
+    if keep_events >= total_events:
+        return split_data
+    print(f"INFO: {split_name} split capped to {keep_events}/{total_events} events (max_{split_name}_events={int(max_events)})")
     return split_data[:keep_events]
 
 # ==========
@@ -143,7 +158,7 @@ def train(epoch_idx: int):
         batch = batch.to(device)
         optimizer.zero_grad()
 
-        src, pos_dst, t, msg, rel = batch.src, batch.dst, batch.t, batch.msg, batch.edge_type
+        src, pos_dst, t, msg = batch.src, batch.dst, batch.t, batch.msg
 
         num_pos = src.size(0)
         neg_dst = torch.randint(
@@ -230,15 +245,16 @@ def test(loader, neg_sampler, split_mode, total_batches=None):
     perf_list = []
 
     for batch_idx, pos_batch in enumerate(loader, start=1):
-        pos_src, pos_dst, pos_t, pos_msg, pos_rel = (
-            pos_batch.src,
-            pos_batch.dst,
-            pos_batch.t,
-            pos_batch.msg,
-            pos_batch.edge_type
-        )
+        pos_src, pos_dst, pos_t, pos_msg = pos_batch.src, pos_batch.dst, pos_batch.t, pos_batch.msg
+        pos_rel = getattr(pos_batch, "edge_type", None)
 
-        neg_batch_list = neg_sampler.query_batch(pos_src, pos_dst, pos_t, pos_rel, split_mode=split_mode)
+        try:
+            if pos_rel is None:
+                neg_batch_list = neg_sampler.query_batch(pos_src, pos_dst, pos_t, split_mode=split_mode)
+            else:
+                neg_batch_list = neg_sampler.query_batch(pos_src, pos_dst, pos_t, pos_rel, split_mode=split_mode)
+        except TypeError:
+            neg_batch_list = neg_sampler.query_batch(pos_src, pos_dst, pos_t, split_mode=split_mode)
 
         # pos_msg_new = torch.cat([pos_msg,pos_rel.unsqueeze(dim=1)], dim=1)   
 
@@ -290,6 +306,102 @@ def test(loader, neg_sampler, split_mode, total_batches=None):
 
     return perf_metrics
 
+
+@torch.no_grad()
+def test_sampled(loader, *, split_mode: str, num_neg_eval: int, seed: int, total_batches=None) -> float:
+    """
+    Sampled-negative MRR evaluation (fixed K per positive), to align with the
+    RelBench baselines in this repo.
+
+    Negatives are sampled from nodes with the same destination node_type as the
+    positive dst (type-filtered).
+    """
+    model["memory"].eval()
+    model["gnn"].eval()
+    model["link_pred"].eval()
+
+    rng = np.random.default_rng(int(seed))
+    node_type_cpu = getattr(dataset, "node_type", None)
+    type_to_nodes: dict[int, np.ndarray] | None = None
+    if node_type_cpu is not None:
+        if torch.is_tensor(node_type_cpu):
+            node_type_cpu = node_type_cpu.detach().cpu().numpy()
+        node_type_cpu = np.asarray(node_type_cpu, dtype=np.int64)
+        type_to_nodes = {}
+        for t in np.unique(node_type_cpu):
+            type_to_nodes[int(t)] = np.flatnonzero(node_type_cpu == int(t)).astype(np.int64)
+
+    dst_pool_all = np.arange(int(min_dst_idx), int(max_dst_idx) + 1, dtype=np.int64)
+
+    k = int(num_neg_eval)
+    mrrs: list[float] = []
+
+    for batch_idx, pos_batch in enumerate(loader, start=1):
+        pos_src, pos_dst, pos_t, pos_msg = pos_batch.src, pos_batch.dst, pos_batch.t, pos_batch.msg
+
+        bsz = int(pos_src.numel())
+        if bsz == 0:
+            continue
+
+        pos_src_np = pos_src.detach().cpu().numpy().astype(np.int64, copy=False)
+        pos_dst_np = pos_dst.detach().cpu().numpy().astype(np.int64, copy=False)
+        neg = np.empty((bsz, k), dtype=np.int64)
+        for i in range(bsz):
+            if type_to_nodes is not None and node_type_cpu is not None:
+                dst_type = int(node_type_cpu[pos_dst_np[i]])
+                pool = type_to_nodes.get(dst_type)
+                if pool is None or pool.size == 0:
+                    pool = dst_pool_all
+            else:
+                pool = dst_pool_all
+            if pool.size == 1:
+                neg[i, :] = pool[0]
+                continue
+            draw = rng.choice(pool, size=k, replace=True).astype(np.int64, copy=False)
+            mask = draw == pos_dst_np[i]
+            tries = 0
+            while mask.any() and tries < 5:
+                draw[mask] = rng.choice(pool, size=int(mask.sum()), replace=True)
+                mask = draw == pos_dst_np[i]
+                tries += 1
+            neg[i, :] = draw
+
+        cand = np.concatenate([pos_dst_np.reshape(bsz, 1), neg], axis=1)  # [B, 1+K]
+        cand_flat = cand.reshape(-1)
+
+        # One neighbor-loader query per batch using union nodes.
+        n_id_np = np.unique(np.concatenate([pos_src_np, cand_flat], axis=0))
+        n_id = torch.from_numpy(n_id_np).to(device=device, dtype=torch.long)
+        n_id, edge_index, e_id = neighbor_loader(n_id)
+        assoc[n_id] = torch.arange(n_id.size(0), device=device)
+
+        z, last_update = model["memory"](n_id)
+        z = model["gnn"](z, last_update, edge_index, data.t[e_id].to(device), data.msg[e_id].to(device))
+
+        src_emb = z[assoc[pos_src]]  # [B,H]
+        cand_t = torch.from_numpy(cand_flat).to(device=device, dtype=torch.long)
+        cand_emb = z[assoc[cand_t]].view(bsz, 1 + k, -1)  # [B,1+K,H]
+
+        src_rep = src_emb.unsqueeze(1).expand(-1, 1 + k, -1).reshape(-1, src_emb.size(-1))
+        dst_rep = cand_emb.reshape(-1, src_emb.size(-1))
+        scores = model["link_pred"](src_rep, dst_rep).view(bsz, 1 + k)
+
+        pos_score = scores[:, 0:1]
+        neg_score = scores[:, 1:]
+        rank = 1 + (neg_score >= pos_score).sum(dim=1)
+        mrrs.append((1.0 / rank.float()).mean().item())
+
+        if LOG_EVERY > 0 and total_batches is not None and batch_idx % LOG_EVERY == 0:
+            print(f"[Eval-{split_mode}-sampled] Processed {batch_idx}/{total_batches} batches")
+
+        # Update memory and neighbor loader with ground-truth edges only.
+        model["memory"].update_state(pos_src, pos_dst, pos_t, pos_msg)
+        neighbor_loader.insert(pos_src, pos_dst)
+
+    if not mrrs:
+        return float("nan")
+    return float(np.mean(mrrs))
+
 # ==========
 # ==========
 # ==========
@@ -306,8 +418,8 @@ start_overall = timeit.default_timer()
 DEFAULT_DATA = "thgl-forum"
 
 # ========== set parameters...
-args, _ = get_args()
-if not args.data or args.data == "tgbl-wiki":
+args, argv = get_args()
+if ("--data" not in argv) and ("-d" not in argv):
     args.data = DEFAULT_DATA
 DATA = args.data
 print("INFO: Arguments:", args)
@@ -337,6 +449,9 @@ TRAIN_NEG_SAMPLES = max(1, args.num_neg_samples)
 CHECKPOINT_EVERY = max(0, args.checkpoint_every)
 print(f"INFO: Training with {TRAIN_NEG_SAMPLES} negative samples per positive edge")
 
+IS_THGL = str(DATA).startswith("thgl-")
+FEATURE_TAG = FEATURE_VERSION if IS_THGL else "raw"
+
 
 
 MODEL_NAME = 'TGN'
@@ -356,36 +471,40 @@ metric = dataset.eval_metric
 
 print ("there are {} nodes and {} edges".format(dataset.num_nodes, dataset.num_edges))
 print(f"INFO: Schema variant = {args.schema_variant}")
-if args.schema_variant == "default18":
-    print ("there are {} relation types".format(dataset.num_rels))
+USE_EDGE_TYPE = hasattr(data, "edge_type") and getattr(data, "edge_type") is not None
+USE_NODE_TYPE = hasattr(dataset, "node_type") and getattr(dataset, "node_type") is not None
+
+if USE_EDGE_TYPE:
+    if args.schema_variant == "default18":
+        print("there are {} relation types".format(getattr(dataset, "num_rels", "unknown")))
+    else:
+        variant_rels = int(data.edge_type.max().item() + 1)
+        print(f"there are {variant_rels} aggregated relation types (original {getattr(dataset, 'num_rels', 'unknown')})")
 else:
-    variant_rels = int(data.edge_type.max().item() + 1)
-    print(f"there are {variant_rels} aggregated relation types (original {dataset.num_rels})")
+    print("INFO: No edge_type detected; running in homogeneous/bipartite mode.")
 
 
 timestamp = data.t
 head = data.src
 tail = data.dst
-edge_type = data.edge_type #relation
-agg_edge_type = getattr(data, "agg_edge_type", edge_type)
-edge_type_dim = len(torch.unique(agg_edge_type))
-
-embed_edge_type = torch.nn.Embedding(edge_type_dim, EDGE_EMB_DIM).to(device)
-with torch.no_grad():
-    edge_type_embeddings = embed_edge_type(agg_edge_type)
-
-
 if USE_EDGE_TYPE:
-    data.msg = torch.cat([data.msg, edge_type_embeddings], dim=1)
+    edge_type = data.edge_type  # relation
+    agg_edge_type = getattr(data, "agg_edge_type", edge_type)
+    edge_type_dim = len(torch.unique(agg_edge_type))
 
-#! node type is a property of the dataset not the temporal data as temporal data has one entry per edge
-node_type = dataset.node_type #node type
+    embed_edge_type = torch.nn.Embedding(edge_type_dim, EDGE_EMB_DIM).to(device)
+    with torch.no_grad():
+        edge_type_embeddings = embed_edge_type(agg_edge_type)
+
+    data.msg = torch.cat([data.msg, edge_type_embeddings], dim=1)
+    print("shape of edge type is", edge_type.shape)
+
 neg_sampler = dataset.negative_sampler
 
-data.__setattr__("node_type", node_type)
-
-print ("shape of edge type is", edge_type.shape)
-print ("shape of node type is", node_type.shape)
+if USE_NODE_TYPE:
+    node_type = dataset.node_type  # node type
+    data.__setattr__("node_type", node_type)
+    print("shape of node type is", node_type.shape)
 
 train_data = data[train_mask]
 val_data = data[val_mask]
@@ -398,6 +517,10 @@ if split_fraction <= 0:
 train_data = _truncate_split(train_data, split_fraction, "train")
 val_data = _truncate_split(val_data, split_fraction, "val")
 test_data = _truncate_split(test_data, split_fraction, "test")
+
+train_data = _cap_split(train_data, int(getattr(args, "max_train_events", 0)), "train")
+val_data = _cap_split(val_data, int(getattr(args, "max_val_events", 0)), "val")
+test_data = _cap_split(test_data, int(getattr(args, "max_test_events", 0)), "test")
 print ("finished loading PyG data")
 
 train_events = int(train_data.num_events)
@@ -428,7 +551,7 @@ wandb_config = {
     "num_edges": dataset.num_edges,
     "num_neg_samples": TRAIN_NEG_SAMPLES,
     "schema_variant": args.schema_variant,
-    "feature_set": FEATURE_VERSION,
+    "feature_set": FEATURE_TAG,
     "gnn_layers": 1,
 }
 if args.wandb_run_name:
@@ -439,7 +562,7 @@ else:
         f"{MODEL_NAME}_{DATA}_aggr-{aggregator_name}"
         f"_bs{BATCH_SIZE}_lr{lr_token}_mem{MEM_DIM}_time{TIME_DIM}"
         f"_emb{EMB_DIM}_neigh{NUM_NEIGHBORS}_layers1_epochs{NUM_EPOCH}"
-        f"_neg{TRAIN_NEG_SAMPLES}_schema{args.schema_variant}_feat{FEATURE_VERSION}"
+        f"_neg{TRAIN_NEG_SAMPLES}_schema{args.schema_variant}_feat{FEATURE_TAG}"
     ).replace("__", "_")
 init_wandb(args, run_name, wandb_config)
 
@@ -562,13 +685,14 @@ for run_idx in range(NUM_RUNS):
 
     # define an early stopper
     save_model_dir = f'{osp.dirname(osp.abspath(__file__))}/saved_models/'
-    save_model_id = f'{MODEL_NAME}_{DATA}_{FEATURE_VERSION}_msg{data.msg.size(-1)}_{SEED}_{run_idx}'
+    save_model_id = f'{MODEL_NAME}_{DATA}_{FEATURE_TAG}_msg{data.msg.size(-1)}_{SEED}_{run_idx}'
     early_stopper = EarlyStopMonitor(save_model_dir=save_model_dir, save_model_id=save_model_id, 
                                     tolerance=TOLERANCE, patience=PATIENCE)
 
     # ==================================================== Train & Validation
-    # loading the validation negative samples
-    dataset.load_val_ns()
+    # loading the validation negative samples (only needed for official eval)
+    if args.eval_mode != "sampled":
+        dataset.load_val_ns()
 
     val_perf_list = []
     start_train_val = timeit.default_timer()
@@ -585,7 +709,16 @@ for run_idx in range(NUM_RUNS):
 
         # validation
         start_val = timeit.default_timer()
-        perf_metric_val = test(val_loader, neg_sampler, split_mode="val", total_batches=NUM_VAL_BATCHES)
+        if args.eval_mode == "sampled":
+            perf_metric_val = test_sampled(
+                val_loader,
+                split_mode="val",
+                num_neg_eval=int(args.num_neg_eval),
+                seed=int(SEED) + 13 + epoch,
+                total_batches=NUM_VAL_BATCHES,
+            )
+        else:
+            perf_metric_val = test(val_loader, neg_sampler, split_mode="val", total_batches=NUM_VAL_BATCHES)
         print(f"\tValidation {metric}: {perf_metric_val: .4f}")
         print(f"\tValidation: Elapsed time (s): {timeit.default_timer() - start_val: .4f}")
         val_payload = {
@@ -613,14 +746,27 @@ for run_idx in range(NUM_RUNS):
     # first, load the best model
     early_stopper.load_checkpoint(model)
 
-    # loading the test negative samples
-    dataset.load_test_ns()
+    # loading the test negative samples (only needed for official eval)
+    if args.eval_mode != "sampled":
+        dataset.load_test_ns()
 
     # final testing
     start_test = timeit.default_timer()
-    perf_metric_test = test(test_loader, neg_sampler, split_mode="test", total_batches=NUM_TEST_BATCHES)
+    if args.eval_mode == "sampled":
+        perf_metric_test = test_sampled(
+            test_loader,
+            split_mode="test",
+            num_neg_eval=int(args.num_neg_eval),
+            seed=int(SEED) + 17,
+            total_batches=NUM_TEST_BATCHES,
+        )
+    else:
+        perf_metric_test = test(test_loader, neg_sampler, split_mode="test", total_batches=NUM_TEST_BATCHES)
 
-    print(f"INFO: Test: Evaluation Setting: >>> ONE-VS-MANY <<< ")
+    if args.eval_mode == "sampled":
+        print(f"INFO: Test: Evaluation Setting: >>> SAMPLED-NEGATIVE (K={int(args.num_neg_eval)}) <<< ")
+    else:
+        print(f"INFO: Test: Evaluation Setting: >>> ONE-VS-MANY <<< ")
     print(f"\tTest: {metric}: {perf_metric_test: .4f}")
     test_time = timeit.default_timer() - start_test
     print(f"\tTest: Elapsed Time (s): {test_time: .4f}")
@@ -638,6 +784,13 @@ for run_idx in range(NUM_RUNS):
                   'data': DATA,
                   'run': run_idx,
                   'seed': SEED,
+                  'eval_mode': getattr(args, "eval_mode", "tgb"),
+                  'num_neg_eval': int(getattr(args, "num_neg_eval", 0) or 0),
+                  'max_train_events': int(getattr(args, "max_train_events", 0) or 0),
+                  'max_val_events': int(getattr(args, "max_val_events", 0) or 0),
+                  'max_test_events': int(getattr(args, "max_test_events", 0) or 0),
+                  'schema_variant': args.schema_variant,
+                  'feature_version': FEATURE_TAG,
                   f'val {metric}': val_perf_list,
                   f'test {metric}': perf_metric_test,
                   'test_time': test_time,

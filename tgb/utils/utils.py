@@ -166,6 +166,17 @@ def get_args():
     parser.add_argument('--schema_cache_dir', type=str, help='Optional cache dir for schema-converted datasets', default=None)
     parser.add_argument('--checkpoint_every', type=int, help='Save model checkpoint every N epochs (0 disables)', default=0)
     parser.add_argument('--checkpoint_dir', type=str, help='Directory for periodic checkpoints (defaults to saved_results/checkpoints)', default=None)
+    parser.add_argument('--max_train_events', type=int, default=0, help='Cap number of training events (0 disables).')
+    parser.add_argument('--max_val_events', type=int, default=0, help='Cap number of validation events (0 disables).')
+    parser.add_argument('--max_test_events', type=int, default=0, help='Cap number of test events (0 disables).')
+    parser.add_argument(
+        '--eval_mode',
+        type=str,
+        choices=['tgb', 'sampled'],
+        default='tgb',
+        help="Evaluation mode: 'tgb' uses the official one-vs-many negatives; 'sampled' uses fixed-K sampled negatives.",
+    )
+    parser.add_argument('--num_neg_eval', type=int, default=100, help='Number of negatives per positive for eval_mode=sampled.')
 
     try:
         args = parser.parse_args()

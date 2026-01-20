@@ -420,3 +420,125 @@ Runs completed (W&B `offline`):
 
 Notes:
 - `thgl-github` is the slowest of the set under this baseline because it has 4 node types and 14 edge types, and evaluation requires scanning all edge-type parquet tables to sample val/test edges.
+
+## `thgl-software`: TGN + GraphAttention (budgeted + sampled-negative eval)
+
+This repo also includes the “TGN + GraphAttention” runner (used historically for `thgl-software`) at:
+- `examples/linkproppred/thgl-forum/tgn.py` (run with `--data thgl-software`)
+
+To make it comparable to the RelBench baselines, we added:
+- `--eval_mode sampled --num_neg_eval K`: sampled-negative MRR with type-filtered negatives (by `node_type`), instead of TGB’s official one-vs-many negatives.
+- `--max_train_events / --max_val_events / --max_test_events`: caps split sizes to match the RelBench budget style (`max_train_edges`, `max_eval_edges`).
+
+Run (default18, CPU):
+- `--max_train_events 200000 --max_val_events 20000 --max_test_events 20000 --eval_mode sampled --num_neg_eval 100 --num_epoch 3`
+
+Result (sampled-negative MRR):
+- val MRR by epoch: `0.1121`, `0.1332`, `0.1423`
+- test MRR (best val checkpoint): `0.1384`
+
+Scaled-up run (same eval; full train split, CPU):
+- `--max_train_events 0 --max_val_events 20000 --max_test_events 20000 --eval_mode sampled --num_neg_eval 100 --num_epoch 3`
+
+Result (sampled-negative MRR):
+- val MRR by epoch: `0.2494`, `0.2676`, `0.2876`
+- test MRR (best val checkpoint): `0.1960`
+
+Note: these are now directly comparable (same “sampled-negative MRR” style) to the RelEventSAGE THGL baseline above, though the models differ substantially (TGN temporal memory vs event-as-node relational GNN).
+
+## TGN + GraphAttention: additional runs (THGL + TGBL; sampled-negative MRR)
+
+We extended `examples/linkproppred/thgl-forum/tgn.py` to also run on `tgbl-*` datasets:
+- THGL (`thgl-*`): uses cached `default18` + `agegap_v1` (`datasets/schema_cache_augmented/<data>_default18_agegap_v1.pt`) and evaluates with **type-filtered** sampled negatives (by destination `node_type`).
+- TGBL (`tgbl-*`): runs directly on the raw `TemporalData` stream and evaluates with **uniform** sampled negatives from the destination id range (`[min(dst), max(dst)]`).
+
+Important compatibility note (this repo’s `tgb` snapshot):
+- `tgbl-wiki-v2` / `tgbl-review-v2` are **not supported** by `PyGLinkPropPredDataset`; use `tgbl-wiki` / `tgbl-review` instead.
+
+All runs below use: `--eval_mode sampled --num_neg_eval 100 --num_epoch 3 --num_run 1 --bs 200`.
+
+### THGL (budgeted train; `max_train_events=200000`, `max_val_events=20000`, `max_test_events=20000`)
+
+- Dataset metadata observed via `PyGLinkPropPredDataset` in this environment:
+  - `thgl-software` / `thgl-github`: 4 node types, 14 relations
+  - `thgl-forum` / `thgl-myket`: 2 node types, 2 relations
+
+- `thgl-github`: val MRR by epoch `0.1028, 0.0973, 0.0928`; test MRR `0.0956`
+- `thgl-forum`: val MRR by epoch `0.2508, 0.4087, 0.3397`; test MRR `0.3218`
+- `thgl-myket`: val MRR by epoch `0.2118, 0.1213, 0.1063`; test MRR `0.1533`
+
+### TGBL (mixed: `wiki` full-train; others budgeted)
+
+- `tgbl-wiki` (full train split; `max_train_events=0`, `max_val_events=20000`, `max_test_events=20000`): val MRR by epoch `0.3700, 0.5493, 0.5996`; test MRR `0.5023`
+- `tgbl-review` (`max_train_events=200000`, `max_val_events=20000`, `max_test_events=20000`): val MRR by epoch `0.0882, 0.0797, 0.0754`; test MRR `0.1013`
+- `tgbl-coin` (`max_train_events=200000`, `max_val_events=20000`, `max_test_events=20000`): val MRR by epoch `0.3228, 0.3831, 0.4423`; test MRR `0.4947`
+- `tgbl-comment` (`max_train_events=200000`, `max_val_events=20000`, `max_test_events=20000`): val MRR by epoch `0.4377, 0.3928, 0.3830`; test MRR `0.3754`
+- `tgbl-flight` (`max_train_events=200000`, `max_val_events=20000`, `max_test_events=20000`): val MRR by epoch `0.4237, 0.5498, 0.5926`; test MRR `0.5563`
+
+### New: RelEventSAGE on non-v2 exports (`tgbl-wiki`, `tgbl-review`)
+
+We exported the *non-v2* datasets into `relbench_exports/` and trained the same RelEventSAGE baseline, so results can be compared directly to the TGN+GraphAttention runs above.
+
+Export:
+- `PYTHONPATH=. .venv/bin/python scripts/export_to_relbench.py --dataset tgbl-wiki --out_dir relbench_exports`
+- `PYTHONPATH=. .venv/bin/python scripts/export_to_relbench.py --dataset tgbl-review --out_dir relbench_exports`
+
+Adjacency build (cutoff = `val`):
+- `PYTHONPATH=. .venv/bin/python scripts/build_rel_event_csr.py --dataset tgbl-wiki --exports_root relbench_exports --upto val`
+- `PYTHONPATH=. .venv/bin/python scripts/build_rel_event_csr.py --dataset tgbl-review --exports_root relbench_exports --upto val`
+
+Training (sampled-negative MRR; `K=100`; `epochs=3`; `train_adj=val`; `eval_adj_test=val`):
+- `tgbl-wiki` (full train split): val MRR `0.3072`, test MRR `0.2663` → `saved_models/releventsage/releventsage_tgbl-wiki.pt`
+- `tgbl-review` (`max_train_edges=200000`): val MRR `0.2679`, test MRR `0.2436` → `saved_models/releventsage/releventsage_tgbl-review.pt`
+
+Artifacts:
+- Results JSON: `examples/linkproppred/thgl-forum/saved_results/TGN_<dataset>_results.json`
+- Model checkpoints: `examples/linkproppred/thgl-forum/saved_models/TGN_<dataset>_<feature_tag>_msg<d>_<seed>_<run>.pth`
+
+## NodeProp (`tgbn-*`): memory-safe export + baseline (MRR + NDCG@10)
+
+Problem encountered:
+- The official TGB nodeprop loader can materialize a **dense** `node_label_dict` with per-(ts,node) dense vectors; for `tgbn-token` this can be prohibitively memory-heavy.
+
+Mitigation / guardrails added:
+- `scripts/export_to_relbench.py` now loads nodeprop **edges without labels** from the processed `ml_<dataset>.pkl` + `ml_<dataset>_edge.pkl` files, to avoid constructing dense label dicts.
+- For `tgbn-token` and `tgbn-reddit`, label tables are stream-written directly from `<dataset>_node_labels.csv` using mapping pickles, emitting only non-zero label weights.
+- `baselines/graphsage_nodeprop.py` now has an RSS guardrail (`--max_rss_gb`, default 50 GB) and uses disk-backed CSR adjacency/label CSR arrays.
+
+Schema notes:
+- Entity table: `nodes(node_id)`
+- Label universe table: `labels(label_id)` (label ids are in `[0, num_classes)` and correspond to the “label nodes” used by these datasets)
+- Interaction/event table: `events(event_id, src_id, dst_id, event_ts, weight)` (stored weight = first edge feature; for `tgbn-token`, first feature is log-normalized as in TGB preprocessing)
+- Label events (targets) as 2 tables:
+  - `label_events(label_event_id, src_id, label_ts)`
+  - `label_event_items(item_id, label_event_id, label_id, label_weight)`
+- No `split` column stored; train/val/test are derived from `metadata.json` cutoffs.
+
+Commands (cache build):
+- `scripts/build_csr_adj.py --dataset <tgbn-*> --upto val`
+- `scripts/build_label_event_csr.py --dataset <tgbn-*>`
+
+Baseline runs (small/guardrailed):
+- Model: `baselines/graphsage_nodeprop.py` (Sampled GraphSAGE encoder; BPR loss; sampled-negative evaluation)
+- Params: `epochs=2`, `batch_size=256`, `fanouts=5,2`, `emb_dim=32`, `hidden_dim=32`, `num_neg_eval=50`, `max_train_events=50k`, `max_eval_events=5k`, adjacency cutoff=`val`, directed CSR.
+
+Results (val / test):
+- `tgbn-trade`:
+  - epoch 2: val MRR `0.9522`, val NDCG@10 `0.3769`; test MRR `0.9393`, test NDCG@10 `0.3765`
+- `tgbn-genre`:
+  - epoch 2: val MRR `0.8682`, val NDCG@10 `0.6169`; test MRR `0.8591`, test NDCG@10 `0.6054`
+- `tgbn-reddit`:
+  - epoch 2: val MRR `0.7804`, val NDCG@10 `0.6474`; test MRR `0.7555`, test NDCG@10 `0.6146`
+- `tgbn-token`:
+  - epoch 2: val MRR `0.4043`, val NDCG@10 `0.3763`; test MRR `0.3405`, test NDCG@10 `0.3098`
+
+Notes:
+- Official `tgbn-*` metric is NDCG@10; we also report sampled-negative MRR for consistency with our other baselines.
+
+### New: Relational GAT-style encoder (nodeprop)
+
+`baselines/graphsage_nodeprop.py` now supports `--model gat`, which swaps the neighbor-mean aggregation for a **sampled multi-head dot-product attention** aggregator (2 layers; attention over sampled neighbors). This keeps the **same** RelBench export, CSR adjacency, and MRR + NDCG@10 evaluation protocol as the GraphSAGE baseline.
+
+Smoke test (to validate correctness; small budget):
+- `PYTHONPATH=. .venv/bin/python baselines/graphsage_nodeprop.py --dataset tgbn-genre --model gat --epochs 1 --batch_size 512 --fanouts 5,2 --emb_dim 32 --hidden_dim 32 --num_heads 4 --num_neg_eval 50 --max_train_events 5000 --max_eval_events 1000 --adj val`
+- Result: epoch 1 val MRR `0.8248`, val NDCG@10 `0.5358`; test MRR `0.8167`, test NDCG@10 `0.5425`

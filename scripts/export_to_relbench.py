@@ -17,6 +17,8 @@ from relbench.base import Database, Table
 
 from tgb.linkproppred.dataset import LinkPropPredDataset
 from tgb.nodeproppred.dataset import NodePropPredDataset
+from tgb.utils.info import DATA_NUM_CLASSES
+from tgb.utils.utils import load_pkl
 
 
 @dataclass(frozen=True)
@@ -43,6 +45,10 @@ def _detect_bipartite_offset(src: np.ndarray, dst: np.ndarray) -> int | None:
     offset = int(src.max()) + 1
     if int(dst.min()) >= offset:
         return offset
+    # Some datasets encode bipartite ids such that dst are in [0, offset) and
+    # src are in [offset, ...). In that case, src.min() is the natural offset.
+    if int(dst.max()) < int(src.min()):
+        return int(src.min())
     return None
 
 
@@ -54,6 +60,86 @@ def _compute_cutoffs(ts: np.ndarray, train_mask: np.ndarray, val_mask: np.ndarra
 
 def _ts_to_utc(ts_s: np.ndarray) -> pd.Series:
     return pd.Series(pd.to_datetime(ts_s.astype(np.int64, copy=False), unit="s", utc=True))
+
+
+def _maybe_convert_years_to_unix_seconds(ts: np.ndarray) -> np.ndarray:
+    """
+    Some nodeprop datasets (notably tgbn-trade) use integer years as timestamps.
+    Convert these to unix seconds at Jan 1 of each year so the RelBench time column
+    is a real timestamp while preserving ordering.
+    """
+    ts_i = np.asarray(ts, dtype=np.int64)
+    if ts_i.size == 0:
+        return ts_i
+    t_min = int(ts_i.min())
+    t_max = int(ts_i.max())
+    # Heuristic: years in [1900, 2100] and small magnitudes compared to unix seconds.
+    if 1900 <= t_min <= 2100 and 1900 <= t_max <= 2100:
+        out = np.empty(ts_i.shape[0], dtype=np.int64)
+        for i, y in enumerate(ts_i.tolist()):
+            out[i] = int(datetime(int(y), 1, 1, tzinfo=timezone.utc).timestamp())
+        return out
+    return ts_i
+
+
+def _generate_splits_by_quantiles(
+    ts_s: np.ndarray, *, val_ratio: float = 0.15, test_ratio: float = 0.15
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    val_time, test_time = list(np.quantile(ts_s, [(1 - val_ratio - test_ratio), (1 - test_ratio)]))
+    train_mask = ts_s <= val_time
+    val_mask = np.logical_and(ts_s <= test_time, ts_s > val_time)
+    test_mask = ts_s > test_time
+    return train_mask, val_mask, test_mask
+
+
+def _load_nodeprop_processed_edges_without_labels(name: str, root: str) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
+    """
+    Load (src, dst, ts_s, weight) for nodeprop datasets WITHOUT materializing the dense node_label_dict.
+
+    For large datasets (tgbn-reddit/token), the official loader constructs dense label vectors and can
+    exhaust memory. Here we rely on the already-created processed pickle files (ml_*.pkl + ml_*_edge.pkl).
+    """
+    dir_name = "_".join(name.split("-"))
+    ds_dir = Path("tgb") / "datasets" / dir_name
+    df_path = ds_dir / f"ml_{name}.pkl"
+    edge_feat_path = ds_dir / f"ml_{name}_edge.pkl"
+    if not df_path.exists() or not edge_feat_path.exists():
+        # Fallback: use official dataset (may be memory heavy).
+        ds = NodePropPredDataset(name=name, root=root, download=True)
+        full = ds.full_data
+        src = np.asarray(full["sources"], dtype=np.int64)
+        dst = np.asarray(full["destinations"], dtype=np.int64)
+        ts_s = np.asarray(full["timestamps"], dtype=np.int64)
+        edge_feat = np.asarray(full["edge_feat"])
+        if edge_feat.ndim == 1:
+            weight = edge_feat.astype(np.float32, copy=False)
+        elif edge_feat.ndim == 2 and edge_feat.shape[1] >= 1:
+            weight = edge_feat[:, 0].astype(np.float32, copy=False)
+        else:
+            weight = np.ones(src.shape[0], dtype=np.float32)
+        return src, dst, ts_s, weight, int(ds.num_classes)
+
+    df = pd.read_pickle(df_path)
+    src = np.asarray(df["u"], dtype=np.int64)
+    dst = np.asarray(df["i"], dtype=np.int64)
+    ts_s = np.asarray(df["ts"], dtype=np.int64)
+    edge_feat = np.asarray(load_pkl(str(edge_feat_path)))
+    if name == "tgbn-token":
+        # Match NodePropPredDataset.generate_processed_files() stability tweak.
+        edge_feat = edge_feat.copy()
+        edge_feat[:, 0] = np.log(edge_feat[:, 0])
+    if edge_feat.ndim == 1:
+        weight = edge_feat.astype(np.float32, copy=False)
+    elif edge_feat.ndim == 2 and edge_feat.shape[1] >= 1:
+        weight = edge_feat[:, 0].astype(np.float32, copy=False)
+    else:
+        weight = np.ones(src.shape[0], dtype=np.float32)
+
+    num_classes = int(DATA_NUM_CLASSES.get(name, 0) or 0)
+    if num_classes <= 0:
+        # Conservative fallback: assume labels are 0..max(dst) if bipartite encoding was used.
+        num_classes = int(dst.max()) + 1 if dst.size else 0
+    return src, dst, ts_s, weight, num_classes
 
 def _relbench_table_metadata_bytes(
     *,
@@ -317,75 +403,70 @@ def _export_link_dataset(name: str, root: str) -> tuple[Database, Cutoffs, dict]
 
 
 def _export_node_dataset(name: str, root: str) -> tuple[Database, Cutoffs, dict]:
-    ds = NodePropPredDataset(name=name, root=root, download=True)
-    full = ds.full_data
-
-    src = np.asarray(full["sources"], dtype=np.int64)
-    dst = np.asarray(full["destinations"], dtype=np.int64)
-    ts_s = np.asarray(full["timestamps"], dtype=np.int64)
-
-    # NodeProp datasets use edge_feat for attributes and store edge_label=1.
-    # We still keep a scalar "weight" if the edge_feat is 1-d, else omit here.
-    edge_feat = np.asarray(full["edge_feat"])
-    weight: Optional[np.ndarray]
-    if edge_feat.ndim == 2 and edge_feat.shape[1] == 1:
-        weight = edge_feat[:, 0].astype(np.float32, copy=False)
-    else:
-        weight = None
-
-    train_mask = np.asarray(ds.train_mask, dtype=bool)
-    val_mask = np.asarray(ds.val_mask, dtype=bool)
-    test_mask = np.asarray(ds.test_mask, dtype=bool)
+    src, dst, ts_raw, weight, num_classes = _load_nodeprop_processed_edges_without_labels(name, root)
+    ts_s = _maybe_convert_years_to_unix_seconds(ts_raw)
+    train_mask, val_mask, test_mask = _generate_splits_by_quantiles(ts_s)
     cutoffs = _compute_cutoffs(ts_s, train_mask, val_mask, test_mask)
 
-    bipartite_offset = _detect_bipartite_offset(src, dst)
     extra_meta: dict = {
-        "bipartite_offset": int(bipartite_offset) if bipartite_offset is not None else None,
-        "num_classes": int(ds.num_classes),
-        "label_timestamps": int(len(ds.label_ts)) if hasattr(ds, "label_ts") else None,
+        "num_classes": int(num_classes),
+        "label_timestamps": None,
+        "__streaming_label_events__": True,
     }
-
-    ts = _ts_to_utc(ts_s)
-    if bipartite_offset is not None:
-        n_src = int(src.max()) + 1
-        n_dst = int(dst.max() - bipartite_offset) + 1
-        src_nodes = pd.DataFrame({"src_id": np.arange(n_src, dtype=np.int64)})
-        dst_nodes = pd.DataFrame({"dst_id": np.arange(n_dst, dtype=np.int64)})
-        events_dict = {
-            "event_id": np.arange(src.shape[0], dtype=np.int64),
-            "src_id": src,
-            "dst_id": (dst - bipartite_offset).astype(np.int64),
-            "event_ts": ts,
-        }
-        if weight is not None:
-            events_dict["weight"] = weight
-        events = pd.DataFrame(events_dict)
-        db = Database(
-            {
-                "src_nodes": Table(df=src_nodes, pkey_col="src_id", fkey_col_to_pkey_table={}, time_col=None),
-                "dst_nodes": Table(df=dst_nodes, pkey_col="dst_id", fkey_col_to_pkey_table={}, time_col=None),
-                "events": Table(df=events, pkey_col="event_id", time_col="event_ts", fkey_col_to_pkey_table={"src_id": "src_nodes", "dst_id": "dst_nodes"}),
-            }
-        )
-        return db, cutoffs, extra_meta
 
     n_nodes = int(max(src.max(), dst.max())) + 1
     nodes = pd.DataFrame({"node_id": np.arange(n_nodes, dtype=np.int64)})
-    events_dict = {
-        "event_id": np.arange(src.shape[0], dtype=np.int64),
-        "src_id": src,
-        "dst_id": dst,
-        "event_ts": ts,
-    }
-    if weight is not None:
-        events_dict["weight"] = weight
-    events = pd.DataFrame(events_dict)
+    labels = pd.DataFrame({"label_id": np.arange(int(num_classes), dtype=np.int64)})
+
+    placeholder_events = pd.DataFrame(
+        {
+            "event_id": np.array([], dtype=np.int64),
+            "src_id": np.array([], dtype=np.int64),
+            "dst_id": np.array([], dtype=np.int64),
+            "event_ts": pd.to_datetime([], utc=True),
+            "weight": np.array([], dtype=np.float32),
+        }
+    )
+    placeholder_label_events = pd.DataFrame(
+        {
+            "label_event_id": np.array([], dtype=np.int64),
+            "src_id": np.array([], dtype=np.int64),
+            "label_ts": pd.to_datetime([], utc=True),
+        }
+    )
+    placeholder_label_items = pd.DataFrame(
+        {
+            "item_id": np.array([], dtype=np.int64),
+            "label_event_id": np.array([], dtype=np.int64),
+            "label_id": np.array([], dtype=np.int64),
+            "label_weight": np.array([], dtype=np.float32),
+        }
+    )
     db = Database(
         {
             "nodes": Table(df=nodes, pkey_col="node_id", fkey_col_to_pkey_table={}, time_col=None),
-            "events": Table(df=events, pkey_col="event_id", time_col="event_ts", fkey_col_to_pkey_table={"src_id": "nodes", "dst_id": "nodes"}),
+            "labels": Table(df=labels, pkey_col="label_id", fkey_col_to_pkey_table={}, time_col=None),
+            "events": Table(
+                df=placeholder_events,
+                pkey_col="event_id",
+                time_col="event_ts",
+                fkey_col_to_pkey_table={"src_id": "nodes", "dst_id": "nodes"},
+            ),
+            "label_events": Table(
+                df=placeholder_label_events,
+                pkey_col="label_event_id",
+                time_col="label_ts",
+                fkey_col_to_pkey_table={"src_id": "nodes"},
+            ),
+            "label_event_items": Table(
+                df=placeholder_label_items,
+                pkey_col="item_id",
+                time_col=None,
+                fkey_col_to_pkey_table={"label_event_id": "label_events", "label_id": "labels"},
+            ),
         }
     )
+    extra_meta["__streaming_events__"] = {"mode": "homogeneous", "num_rows": int(src.shape[0])}
     return db, cutoffs, extra_meta
 
 
@@ -434,13 +515,19 @@ def main() -> None:
             table.save(db_dir / f"{name}.parquet")
 
         # Re-load the raw arrays from TGB again (cheap vs holding huge DF) and stream-write parquet.
-        ds = LinkPropPredDataset(name=internal_name, root=args.root, download=True)
-        full = ds.full_data
-        src = np.asarray(full["sources"], dtype=np.int64)
-        dst = np.asarray(full["destinations"], dtype=np.int64)
-        ts_s = np.asarray(full["timestamps"], dtype=np.int64)
-        weight = np.asarray(full["w"], dtype=np.float32)
-        bipartite_offset = stream["mode"] == "bipartite" and _detect_bipartite_offset(src, dst) or None
+        # Note: tgbn-* is nodeprop and has a different loader than linkproppred.
+        if dataset_name.startswith("tgbn-"):
+            src, dst, ts_raw, weight, _num_classes = _load_nodeprop_processed_edges_without_labels(internal_name, args.root)
+            ts_s = _maybe_convert_years_to_unix_seconds(ts_raw)
+            bipartite_offset = None
+        else:
+            ds = LinkPropPredDataset(name=internal_name, root=args.root, download=True)
+            full = ds.full_data
+            src = np.asarray(full["sources"], dtype=np.int64)
+            dst = np.asarray(full["destinations"], dtype=np.int64)
+            ts_s = np.asarray(full["timestamps"], dtype=np.int64)
+            weight = np.asarray(full["w"], dtype=np.float32)
+            bipartite_offset = stream["mode"] == "bipartite" and _detect_bipartite_offset(src, dst) or None
 
         out_events = db_dir / "events.parquet"
         ts_ns = ts_s.astype(np.int64, copy=False) * 1_000_000_000
@@ -557,6 +644,239 @@ def main() -> None:
             )
     else:
         db.save(db_dir)
+
+    # NodeProp: stream-write label tables (can be large); implemented in a normalized
+    # relational form (label_events + label_event_items).
+    if dataset_name.startswith("tgbn-") and meta_extra.get("__streaming_label_events__"):
+        # IMPORTANT: For large datasets (tgbn-reddit/token), the official loader builds dense label vectors.
+        # Instead, stream from the raw node-label CSV and only emit non-zeros.
+        stream_from_csv = internal_name in ("tgbn-token", "tgbn-reddit")
+        dir_name = "_".join(internal_name.split("-"))
+        ds_dir = Path("tgb") / "datasets" / dir_name
+        nodefile = ds_dir / f"{internal_name}_node_labels.csv"
+        if stream_from_csv and nodefile.exists():
+            label_dict = None
+        else:
+            # Fallback to the official dataset (may be memory heavy for large datasets).
+            ds = NodePropPredDataset(name=internal_name, root=args.root, download=True, preprocess=True)
+            label_dict = ds.full_data["node_label_dict"]  # {ts: {src_id: label_vec}}
+
+        # Table metadata (RelBench).
+        label_events_meta = _relbench_table_metadata_bytes(
+            fkey_col_to_pkey_table={"src_id": "nodes"},
+            pkey_col="label_event_id",
+            time_col="label_ts",
+        )
+        label_items_meta = _relbench_table_metadata_bytes(
+            fkey_col_to_pkey_table={"label_event_id": "label_events", "label_id": "labels"},
+            pkey_col="item_id",
+            time_col=None,
+        )
+
+        label_events_path = db_dir / "label_events.parquet"
+        label_items_path = db_dir / "label_event_items.parquet"
+
+        # Arrow schemas (normalized; avoids list columns).
+        label_events_schema = pa.schema(
+            [
+                ("label_event_id", pa.int64()),
+                ("src_id", pa.int64()),
+                ("label_ts", pa.timestamp("ns", tz="UTC")),
+            ]
+        ).with_metadata(label_events_meta)
+        label_items_schema = pa.schema(
+            [
+                ("item_id", pa.int64()),
+                ("label_event_id", pa.int64()),
+                ("label_id", pa.int64()),
+                ("label_weight", pa.float32()),
+            ]
+        ).with_metadata(label_items_meta)
+
+        # Stream-write.
+        chunk_rows = int(args.chunk_size)
+        le_writer = pq.ParquetWriter(label_events_path, label_events_schema, compression="zstd")
+        li_writer = pq.ParquetWriter(label_items_path, label_items_schema, compression="zstd")
+        try:
+            le_id = 0
+            item_id = 0
+            le_buf_id: list[int] = []
+            le_buf_src: list[int] = []
+            le_buf_ts_ns: list[int] = []
+
+            li_buf_item: list[int] = []
+            li_buf_le: list[int] = []
+            li_buf_label: list[int] = []
+            li_buf_weight: list[float] = []
+
+            def flush():
+                nonlocal le_buf_id, le_buf_src, le_buf_ts_ns, li_buf_item, li_buf_le, li_buf_label, li_buf_weight
+                if le_buf_id:
+                    le_tbl = pa.Table.from_pydict(
+                        {
+                            "label_event_id": pa.array(le_buf_id, type=pa.int64()),
+                            "src_id": pa.array(le_buf_src, type=pa.int64()),
+                            "label_ts": pa.array(le_buf_ts_ns, type=pa.timestamp("ns", tz="UTC")),
+                        },
+                        schema=label_events_schema,
+                    )
+                    le_writer.write_table(le_tbl)
+                    le_buf_id = []
+                    le_buf_src = []
+                    le_buf_ts_ns = []
+                if li_buf_item:
+                    li_tbl = pa.Table.from_pydict(
+                        {
+                            "item_id": pa.array(li_buf_item, type=pa.int64()),
+                            "label_event_id": pa.array(li_buf_le, type=pa.int64()),
+                            "label_id": pa.array(li_buf_label, type=pa.int64()),
+                            "label_weight": pa.array(li_buf_weight, type=pa.float32()),
+                        },
+                        schema=label_items_schema,
+                    )
+                    li_writer.write_table(li_tbl)
+                    li_buf_item = []
+                    li_buf_le = []
+                    li_buf_label = []
+                    li_buf_weight = []
+
+            if label_dict is not None:
+                # Iterate in timestamp order for reproducibility.
+                for ts in sorted(label_dict.keys()):
+                    ts_s = int(_maybe_convert_years_to_unix_seconds(np.asarray([int(ts)], dtype=np.int64))[0])
+                    ts_ns = ts_s * 1_000_000_000
+                    node_map = label_dict[ts]
+                    for src_id, label_vec in node_map.items():
+                        label_vec = np.asarray(label_vec)
+                        idx = np.flatnonzero(label_vec)
+                        if idx.size == 0:
+                            continue
+                        weights = label_vec[idx].astype(np.float32, copy=False)
+
+                        le_buf_id.append(le_id)
+                        le_buf_src.append(int(src_id))
+                        le_buf_ts_ns.append(ts_ns)
+
+                        for lab, w in zip(idx.tolist(), weights.tolist()):
+                            li_buf_item.append(item_id)
+                            li_buf_le.append(le_id)
+                            li_buf_label.append(int(lab))
+                            li_buf_weight.append(float(w))
+                            item_id += 1
+
+                        le_id += 1
+
+                        if len(le_buf_id) >= chunk_rows:
+                            flush()
+            else:
+                # Stream directly from nodefile CSV grouped by (ts, src).
+                import csv
+
+                # For large datasets, the preprocessing stores mapping dicts on disk:
+                # - <ds_dir>/ml_<name>_node.pkl: node_ids mapping (raw id -> global int id)
+                # - <ds_dir>/ml_<name>_label.pkl: label mapping (raw label -> label id in [0, num_classes))
+                node_map_path = ds_dir / f"ml_{internal_name}_node.pkl"
+                label_map_path = ds_dir / f"ml_{internal_name}_label.pkl"
+                node_ids = load_pkl(str(node_map_path)) if node_map_path.exists() else None
+                label_ids = load_pkl(str(label_map_path)) if label_map_path.exists() else None
+
+                # Column names differ slightly across datasets.
+                # tgbn-trade: year,nation,trading nation,weight  (no label_map_path; ids come from node_ids)
+                # tgbn-genre: ts,user_id,genre,weight (no label_map_path in current preprocessing)
+                # tgbn-reddit: ts,user,subreddit,weight
+                # tgbn-token: ts,user_address,token_address,weight
+                with open(nodefile, "r", newline="") as f:
+                    reader = csv.DictReader(f)
+                    # Determine user + label columns.
+                    if "user_address" in reader.fieldnames:
+                        user_col = "user_address"
+                        label_col = "token_address"
+                    elif "user" in reader.fieldnames:
+                        user_col = "user"
+                        label_col = "subreddit"
+                    elif "nation" in reader.fieldnames:
+                        user_col = "nation"
+                        label_col = "trading nation"
+                    else:
+                        user_col = reader.fieldnames[1]
+                        label_col = reader.fieldnames[2]
+
+                    # Basic guardrail: require consecutive grouping by (ts,user) to avoid duplicates.
+                    cur_ts = None
+                    cur_user = None
+                    cur_src_id: int | None = None
+                    cur_ts_s: int | None = None
+                    cur_items: dict[int, float] = {}
+                    seen_users_this_ts: set[int] = set()
+
+                    def flush_group():
+                        nonlocal le_id, item_id, cur_items
+                        if cur_src_id is None or cur_ts_s is None or not cur_items:
+                            cur_items = {}
+                            return
+                        ts_s = int(cur_ts_s)
+                        ts_s = int(_maybe_convert_years_to_unix_seconds(np.asarray([ts_s], dtype=np.int64))[0])
+                        ts_ns = ts_s * 1_000_000_000
+
+                        le_buf_id.append(le_id)
+                        le_buf_src.append(int(cur_src_id))
+                        le_buf_ts_ns.append(int(ts_ns))
+                        for lab, w in cur_items.items():
+                            li_buf_item.append(item_id)
+                            li_buf_le.append(le_id)
+                            li_buf_label.append(int(lab))
+                            li_buf_weight.append(float(w))
+                            item_id += 1
+                        le_id += 1
+                        cur_items = {}
+                        if len(le_buf_id) >= chunk_rows:
+                            flush()
+
+                    for row in reader:
+                        ts_raw = int(row.get("ts") or row.get("year") or row.get("timestamp"))
+                        user_raw = row[user_col]
+                        label_raw = row[label_col]
+                        w = float(row.get("weight") or row.get("value") or row.get("w") or 1.0)
+
+                        if node_ids is not None:
+                            src_id = int(node_ids[user_raw])
+                        else:
+                            # Fall back to integer parsing (already numeric).
+                            src_id = int(user_raw)
+
+                        if label_ids is not None:
+                            lab_id = int(label_ids[label_raw])
+                        elif node_ids is not None and label_raw in node_ids:
+                            # trade uses node_ids for both nation and trading nation.
+                            lab_id = int(node_ids[label_raw])
+                        else:
+                            lab_id = int(label_raw)
+
+                        key = (ts_raw, src_id)
+                        if cur_ts is None:
+                            cur_ts, cur_user, cur_src_id, cur_ts_s = ts_raw, src_id, src_id, ts_raw
+                        if ts_raw != cur_ts or src_id != cur_user:
+                            # Close previous group.
+                            seen_users_this_ts.add(int(cur_user))
+                            flush_group()
+                            if ts_raw != cur_ts:
+                                seen_users_this_ts = set()
+                            else:
+                                if src_id in seen_users_this_ts:
+                                    raise RuntimeError(
+                                        f"node_labels.csv is not grouped by (ts,user): saw user={src_id} twice at ts={ts_raw}."
+                                    )
+                            cur_ts, cur_user, cur_src_id, cur_ts_s = ts_raw, src_id, src_id, ts_raw
+
+                        # Accumulate latest weight per label id.
+                        cur_items[lab_id] = w
+
+                    flush_group()
+
+            flush()
+        finally:
+            le_writer.close()
+            li_writer.close()
 
     metadata = {
         "dataset": dataset_name,
