@@ -229,6 +229,27 @@ db_full = ds.get_db(upto_test_timestamp=False)
 
 `Dataset.get_db()` defaults to `upto_test_timestamp=True` to prevent test leakage; set `False` when you need the full database (e.g., to compute labels after the test cutoff).
 
+### Upstream RelBench PR prep (local artifacts + hashes)
+
+We prepared a PR against `snap-stanford/relbench` to add the converted TGB datasets + tasks (all non-KG families: `tgbl-*`, `tgbn-*`, `thgl-*`).
+
+RelBench repo state:
+- Repo: `/home/pc0618/relbench`
+- Branch: `add-tgb-datasets`
+- Commits:
+  - `fb07391`: add `relbench/relbench/datasets/tgb.py`, `relbench/relbench/tasks/tgb.py`, and register all `rel-tgb-*` datasets/tasks
+  - `0917ac0`: fix `thgl-github` task registrations to match actual type-pairs; switch tasks to “next” semantics; add SHA256 entries to `relbench/relbench/datasets/hashes.json` + `relbench/relbench/tasks/hashes.json`
+
+Local zip artifacts (hosting TBD):
+- Dataset zips: `/home/pc0618/relbench_tgb_artifacts/rel-tgb-*/db.zip`
+- Task zips: `/home/pc0618/relbench_tgb_artifacts/rel-tgb-*/tasks/*.zip`
+- Hash manifests (used to populate RelBench hashes.json files):
+  - `/home/pc0618/relbench_tgb_artifacts/hashes_datasets.json`
+  - `/home/pc0618/relbench_tgb_artifacts/hashes_tasks.json`
+
+Remaining step for `relbench/CONTRIBUTING.md`:
+- Decide where to host `db.zip` and `<task>.zip` files and include the hosted links in the PR description (hashes are already computed/added).
+
 ### Status: Dynamic Link Property Prediction exports (`tgbl-*`)
 
 Exports were generated under `TGB2/relbench_exports/` using `scripts/export_to_relbench.py`.
