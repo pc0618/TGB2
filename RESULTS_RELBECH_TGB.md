@@ -31,7 +31,11 @@ Optional variant (same pipeline):
 
 ### A2) Existing RelBench datasets: entity prediction
 
-Not summarized here yet (this repo’s current “existing RelBench” smoke focus was on link-prediction recommendation tasks like `rel-f1`/`rel-hm`).
+Smoke results (existing RelBench datasets; official metrics):
+
+| Dataset | Task | Model | Val (selected metric) | Test (selected metric) | Logs |
+|---|---|---|---:|---:|---|
+| `rel-event` | `user-repeat` | GAT | AP `0.5247` | AP `0.5017` | `relbench_runs/logs/rel-event_user-repeat_gnn_gat_smoke.txt` |
 
 ## B) Link prediction
 
@@ -52,16 +56,19 @@ Translated TGB → RelBench exports (apples-to-apples sampled-negative MRR@100 o
 
 ### B1) Existing RelBench datasets (official recommendation evaluation; MAP@10)
 
-| Dataset | Task | GraphSAGE val MAP@10 | TGN+Attn val MAP@10 | Test |
+| Dataset | Task | GraphSAGE val MAP@10 | TGN+Attn val MAP@10 | Notes |
 |---|---|---:|---:|---|
-| `rel-f1` | `driver-race-compete` | 0.06048 | 0.27821 | `<empty test split>` |
-| `rel-hm` | `user-item-purchase` | 0.0006649 | 0.0009053 | non-empty (see logs) |
+| `rel-f1` | `driver-race-compete` | 0.06048 | 0.27821 | some evals may be skipped if a split is empty; see logs |
+| `rel-hm` | `user-item-purchase` | 0.0006649 | 0.0009053 |  |
+| `rel-stack` | `post-post-related` | 0.0024797 | 0.00017857 |  |
 
 Logs:
 - `relbench_runs/rel-f1_gnn_sage_epoch1.txt`
 - `relbench_runs/rel-f1/tgn_attention_nocap_20260129_011052.txt`
 - `relbench_runs/logs/smoke_existing_20260128_215438_rel-hm_user-item-purchase_gnn_sage_smoke.txt`
 - `relbench_runs/logs/smoke_existing_20260128_215438_rel-hm_user-item-purchase_tgn_attention_smoke.txt`
+- `relbench_runs/logs/smoke_existing_20260129_045608_rel-stack_post-post-related_gnn_sage_smoke.txt`
+- `relbench_runs/logs/smoke_existing_20260129_045546_rel-stack_post-post-related_tgn_attention_smoke.txt`
 
 ### B2) Translated TGB → RelBench exports: Dynamic Link Property Prediction (`tgbl-*`) (sampled-negative MRR@100)
 
