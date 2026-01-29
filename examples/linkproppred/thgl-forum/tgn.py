@@ -209,13 +209,17 @@ def train(epoch_idx: int):
         if LOG_EVERY > 0 and batch_idx % LOG_EVERY == 0:
             est_batches = max(1, NUM_TRAIN_BATCHES)
             global_step = (epoch_idx - 1) * est_batches + batch_idx
+            pos_mean = float(pos_out.mean().detach())
+            neg_mean = float(neg_out.mean().detach())
             print(
                 f"[Train] Epoch {epoch_idx} Batch {batch_idx}/{est_batches} "
-                f"loss={batch_loss:.4f} pos={float(pos_out.mean()):.4f} neg={float(neg_out.mean()):.4f}"
+                f"loss={batch_loss:.4f} pos={pos_mean:.4f} neg={neg_mean:.4f}"
             )
             log_to_wandb(
                 {
-                    "train_batch_loss": batch_loss,
+                    "train/batch_loss": batch_loss,
+                    "train/batch_pos_mean": pos_mean,
+                    "train/batch_neg_mean": neg_mean,
                     "train_batch": batch_idx,
                     "epoch": epoch_idx,
                     "run_batch_step": global_step,
@@ -700,11 +704,12 @@ for run_idx in range(NUM_RUNS):
         # training
         start_epoch_train = timeit.default_timer()
         loss = train(epoch)
+        epoch_train_time = timeit.default_timer() - start_epoch_train
         epoch_step = epoch + run_idx * NUM_EPOCH
         print(
-            f"Epoch: {epoch:02d}, Loss: {loss:.4f}, Training elapsed Time (s): {timeit.default_timer() - start_epoch_train: .4f}"
+            f"Epoch: {epoch:02d}, Loss: {loss:.4f}, Training elapsed Time (s): {epoch_train_time: .4f}"
         )
-        log_to_wandb({"epoch": epoch, "train_loss": loss, "run_idx": run_idx})
+        log_to_wandb({"epoch": epoch, "train/loss": loss, "train/epoch_time_s": epoch_train_time, "run_idx": run_idx})
         append_metric_log("train", epoch, "loss", loss)
 
         # validation
@@ -719,10 +724,12 @@ for run_idx in range(NUM_RUNS):
             )
         else:
             perf_metric_val = test(val_loader, neg_sampler, split_mode="val", total_batches=NUM_VAL_BATCHES)
+        val_time_s = timeit.default_timer() - start_val
         print(f"\tValidation {metric}: {perf_metric_val: .4f}")
-        print(f"\tValidation: Elapsed time (s): {timeit.default_timer() - start_val: .4f}")
+        print(f"\tValidation: Elapsed time (s): {val_time_s: .4f}")
         val_payload = {
-            f"val_{metric}": perf_metric_val,
+            f"val/{metric}": perf_metric_val,
+            "val/time_s": val_time_s,
             "epoch": epoch,
             "run_idx": run_idx,
         }
@@ -740,7 +747,7 @@ for run_idx in range(NUM_RUNS):
 
     train_val_time = timeit.default_timer() - start_train_val
     print(f"Train & Validation: Elapsed Time (s): {train_val_time: .4f}")
-    log_to_wandb({"train_val_time": train_val_time, "run_idx": run_idx})
+    log_to_wandb({"train_val_time_s": train_val_time, "run_idx": run_idx})
 
     # ==================================================== Test
     # first, load the best model
@@ -771,8 +778,8 @@ for run_idx in range(NUM_RUNS):
     test_time = timeit.default_timer() - start_test
     print(f"\tTest: Elapsed Time (s): {test_time: .4f}")
     test_payload = {
-        f"test_{metric}": perf_metric_test,
-        "test_time": test_time,
+        f"test/{metric}": perf_metric_test,
+        "test/time_s": test_time,
         "run_idx": run_idx,
     }
     if metric == "mrr":

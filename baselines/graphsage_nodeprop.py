@@ -134,6 +134,22 @@ class SampledGAT(nn.Module):
         return out
 
 
+class EmbeddingOnly(nn.Module):
+    def __init__(self, *, num_nodes: int, out_dim: int, dropout: float):
+        super().__init__()
+        self.emb = nn.Embedding(int(num_nodes), int(out_dim))
+        self.drop = nn.Dropout(float(dropout))
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.normal_(self.emb.weight, std=0.02)
+
+    def encode(self, seeds: torch.Tensor, adj: CSRAdjacency, rng: np.random.Generator, device: torch.device) -> torch.Tensor:
+        del adj, rng  # unused
+        out = self.emb(seeds.to(device))
+        return self.drop(out)
+
+
 @dataclass(frozen=True)
 class LabelCSR:
     indptr: np.ndarray
@@ -263,40 +279,45 @@ def _evaluate(
     if max_events > 0 and event_ids.size > max_events:
         event_ids = rng.choice(event_ids, size=max_events, replace=False)
 
+    # Encode all label nodes once (labels are assumed to live in 0..label_universe-1).
+    label_ids = torch.arange(int(label_universe), device=device, dtype=torch.long)
+    z_labels = model.encode(label_ids, adj, rng=rng, device=device)  # [C,H]
+
+    src_ids = csr.src_ids[event_ids].astype(np.int64, copy=False)
+    src_t = torch.from_numpy(src_ids).to(device=device, dtype=torch.long)
+    z_src = model.encode(src_t, adj, rng=rng, device=device)  # [B,H]
+
+    scores = (z_src @ z_labels.t()).detach().cpu().numpy().astype(np.float64, copy=False)  # [B,C]
+    k = int(ndcg_k)
+    k = max(1, k)
+    discounts = 1.0 / np.log2(np.arange(k, dtype=np.float64) + 2.0)
+
     mrrs: list[float] = []
     ndcgs: list[float] = []
-    for ev in event_ids.tolist():
-        src_id = int(csr.src_ids[ev])
+    for row, ev in enumerate(event_ids.tolist()):
         pos_ids, pos_w = _label_candidates_for_event(csr, int(ev))
         if pos_ids.size == 0:
             continue
-        # Candidate set = positives + sampled negatives.
-        neg_ids = _sample_negatives(rng=rng, num_neg=num_neg, label_universe=label_universe, positives=pos_ids)
-        cand = np.concatenate([pos_ids, neg_ids], axis=0)
-        rel = np.concatenate([pos_w, np.zeros_like(neg_ids, dtype=np.float32)], axis=0)
 
-        src = torch.tensor([src_id], device=device, dtype=torch.long)
-        cand_t = torch.from_numpy(cand).to(device=device, dtype=torch.long)
-        z_src = model.encode(src, adj, rng=rng, device=device)  # [1,H]
-        z_c = model.encode(cand_t, adj, rng=rng, device=device)  # [C,H]
-        score = (z_c * z_src.expand_as(z_c)).sum(dim=1).detach().cpu().numpy()
+        # Top-k predicted labels.
+        s = scores[row]
+        kk = min(k, s.shape[0])
+        topk = np.argpartition(-s, kth=kk - 1)[:kk]
+        topk = topk[np.argsort(-s[topk], kind="mergesort")]
 
-        order = np.argsort(-score, kind="mergesort")
-        ranked_rel = rel[order]
-        ranked_is_pos = order < pos_ids.size  # True for positives in the concatenated list
+        # MRR (aux metric): reciprocal rank of best positive label under full label ranking.
+        best_pos_score = float(np.max(s[pos_ids.astype(np.int64, copy=False)]))
+        rank = 1 + int((s >= best_pos_score).sum() - 1)  # pessimistic tie handling
+        mrrs.append(float(1.0 / float(rank)))
 
-        # MRR: reciprocal rank of best positive.
-        pos_ranks = np.flatnonzero(ranked_is_pos) + 1
-        mrrs.append(float(1.0 / float(pos_ranks.min())))
+        # NDCG@k with exponential gain (matches sklearn.ndcg_score default gain).
+        rel_map = {int(l): float(w) for l, w in zip(pos_ids.tolist(), pos_w.astype(np.float64).tolist())}
+        gains = np.fromiter((np.exp2(rel_map.get(int(l), 0.0)) - 1.0 for l in topk.tolist()), dtype=np.float64)
+        dcg = float((gains * discounts[: gains.shape[0]]).sum())
 
-        # NDCG@k with gain = relevance weight (simplified).
-        k = int(ndcg_k)
-        k = min(k, ranked_rel.size)
-        denom = np.log2(np.arange(2, k + 2, dtype=np.float64))
-        dcg = float((ranked_rel[:k].astype(np.float64) / denom).sum())
-        ideal = np.sort(pos_w.astype(np.float64))[::-1]
-        ideal_k = min(k, ideal.size)
-        idcg = float((ideal[:ideal_k] / np.log2(np.arange(2, ideal_k + 2, dtype=np.float64))).sum())
+        ideal_rel = np.sort(pos_w.astype(np.float64))[::-1]
+        ideal_top = ideal_rel[:kk]
+        idcg = float(((np.exp2(ideal_top) - 1.0) * discounts[: ideal_top.shape[0]]).sum())
         ndcgs.append(float(dcg / idcg) if idcg > 0 else 0.0)
 
     if not mrrs:
@@ -326,7 +347,7 @@ def main() -> None:
     parser.add_argument("--adj", default="val", help="CSR adjacency cutoff: val | test | all | <unix_seconds>")
     parser.add_argument("--undirected", action="store_true")
     parser.add_argument("--device", default="cpu")
-    parser.add_argument("--model", default="sage", choices=["sage", "gat"])
+    parser.add_argument("--model", default="sage", choices=["sage", "gat", "emb"])
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=1e-2)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
@@ -346,6 +367,8 @@ def main() -> None:
     parser.add_argument("--max_eval_events", type=int, default=20000)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--save_dir", default=None)
+    parser.add_argument("--checkpoint_every", type=int, default=0, help="Save checkpoint every N epochs (0 disables).")
+    parser.add_argument("--checkpoint_dir", default=None, help="Directory for epoch checkpoints (defaults to <save_dir>/checkpoints if save_dir is set).")
     parser.add_argument("--max_rss_gb", type=float, default=50.0, help="Abort early if process RSS exceeds this many GB (best-effort guardrail).")
 
     parser.add_argument("--wandb", action="store_true")
@@ -398,7 +421,7 @@ def main() -> None:
             fanouts=(fan1, fan2),
             dropout=float(args.dropout),
         ).to(device)
-    else:
+    elif args.model == "gat":
         model = SampledGAT(
             num_nodes=int(num_nodes),
             emb_dim=int(args.emb_dim),
@@ -408,6 +431,8 @@ def main() -> None:
             num_heads=int(args.num_heads),
             attn_dropout=float(args.attn_dropout),
         ).to(device)
+    else:
+        model = EmbeddingOnly(num_nodes=int(num_nodes), out_dim=int(args.hidden_dim), dropout=float(args.dropout)).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
 
     wb = _maybe_init_wandb(
@@ -436,6 +461,53 @@ def main() -> None:
         f"Dataset={args.dataset} model={args.model} nodes={num_nodes} label_events(train/val/test)={train_ids.size}/{val_ids.size}/{test_ids.size} "
         f"label_universe={label_universe} adj_suffix={suffix}"
     )
+
+    def _save_checkpoint(path: Path, *, epoch: int, val_mrr: float, val_ndcg: float, test_mrr: float, test_ndcg: float) -> None:
+        payload = {
+            "epoch": int(epoch),
+            "dataset": args.dataset,
+            "exports_root": str(exports_root),
+            "adj": args.adj,
+            "undirected": bool(args.undirected),
+            "meta": {"val_timestamp_s": meta.val_timestamp_s, "test_timestamp_s": meta.test_timestamp_s},
+            "model": {
+                "arch": args.model,
+                "num_nodes": int(num_nodes),
+                "emb_dim": int(args.emb_dim),
+                "hidden_dim": int(args.hidden_dim),
+                "fanouts": [fan1, fan2],
+                "dropout": float(args.dropout),
+                "num_heads": int(args.num_heads) if args.model == "gat" else None,
+                "attn_dropout": float(args.attn_dropout) if args.model == "gat" else None,
+            },
+            "metrics": {
+                "val_mrr": float(val_mrr),
+                f"val_ndcg@{int(args.ndcg_k)}": float(val_ndcg),
+                "test_mrr": float(test_mrr),
+                f"test_ndcg@{int(args.ndcg_k)}": float(test_ndcg),
+            },
+            "state_dict": model.state_dict(),
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(payload, path)
+        print(f"Saved checkpoint to {path}")
+
+    ckpt_every = int(args.checkpoint_every) if args.checkpoint_every else 0
+    if ckpt_every > 0:
+        if args.checkpoint_dir:
+            ckpt_dir = Path(args.checkpoint_dir)
+        elif args.save_dir:
+            ckpt_dir = Path(args.save_dir) / "checkpoints"
+        else:
+            ckpt_dir = Path("saved_models") / "nodeprop_checkpoints"
+    else:
+        ckpt_dir = None
+
+    last_epoch = 0
+    last_val_mrr = float("nan")
+    last_val_ndcg = float("nan")
+    last_test_mrr = float("nan")
+    last_test_ndcg = float("nan")
 
     for epoch in range(1, int(args.epochs) + 1):
         if args.max_rss_gb and args.max_rss_gb > 0:
@@ -516,6 +588,11 @@ def main() -> None:
             seed=int(args.seed) + 17 + epoch,
             max_events=int(args.max_eval_events),
         )
+
+        last_epoch = int(epoch)
+        last_val_mrr, last_val_ndcg = float(val_mrr), float(val_ndcg)
+        last_test_mrr, last_test_ndcg = float(test_mrr), float(test_ndcg)
+
         print(
             f"epoch={epoch} loss={avg_loss:.4f} val_mrr={val_mrr:.4f} val_ndcg@{int(args.ndcg_k)}={val_ndcg:.4f} "
             f"test_mrr={test_mrr:.4f} test_ndcg@{int(args.ndcg_k)}={test_ndcg:.4f}"
@@ -532,30 +609,29 @@ def main() -> None:
                 }
             )
 
+        if ckpt_dir is not None and (epoch % ckpt_every == 0):
+            ckpt_path = ckpt_dir / f"{args.model}_nodeprop_{args.dataset}_epoch{epoch:03d}.pt"
+            _save_checkpoint(
+                ckpt_path,
+                epoch=int(epoch),
+                val_mrr=float(val_mrr),
+                val_ndcg=float(val_ndcg),
+                test_mrr=float(test_mrr),
+                test_ndcg=float(test_ndcg),
+            )
+
     if args.save_dir:
         save_dir = Path(args.save_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
-        out = {
-            "dataset": args.dataset,
-            "exports_root": str(exports_root),
-            "adj": args.adj,
-            "undirected": bool(args.undirected),
-            "meta": {"val_timestamp_s": meta.val_timestamp_s, "test_timestamp_s": meta.test_timestamp_s},
-            "model": {
-                "arch": args.model,
-                "num_nodes": int(num_nodes),
-                "emb_dim": int(args.emb_dim),
-                "hidden_dim": int(args.hidden_dim),
-                "fanouts": [fan1, fan2],
-                "dropout": float(args.dropout),
-                "num_heads": int(args.num_heads) if args.model == "gat" else None,
-                "attn_dropout": float(args.attn_dropout) if args.model == "gat" else None,
-            },
-            "state_dict": model.state_dict(),
-        }
-        ckpt_path = save_dir / f"{args.model}_nodeprop_{args.dataset}.pt"
-        torch.save(out, ckpt_path)
-        print(f"Saved checkpoint to {ckpt_path}")
+        final_path = save_dir / f"{args.model}_nodeprop_{args.dataset}.pt"
+        _save_checkpoint(
+            final_path,
+            epoch=int(last_epoch),
+            val_mrr=float(last_val_mrr),
+            val_ndcg=float(last_val_ndcg),
+            test_mrr=float(last_test_mrr),
+            test_ndcg=float(last_test_ndcg),
+        )
 
     if wb is not None:
         wb.finish()

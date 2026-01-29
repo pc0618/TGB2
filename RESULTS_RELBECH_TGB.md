@@ -27,7 +27,18 @@ Metrics:
 
 Optional variant (same pipeline):
 - `TGB2/baselines/graphsage_nodeprop.py --model gat` (relational GAT-style neighbor attention)
-- Smoke test (budgeted): `tgbn-genre` epoch 1 → val MRR `0.8248`, val NDCG@10 `0.5358`; test MRR `0.8167`, test NDCG@10 `0.5425`
+
+Real test (CPU; best epoch by val NDCG@10; all runs used `adj=val`, `fanouts=10,5`, `emb_dim=64`, `hidden_dim=64`, `num_heads=4`, `dropout=0.1`, `attn_dropout=0.1`, `num_neg_eval=100`, `max_train_events=200000`, `max_eval_events=20000`, `epochs=5`):
+
+| Dataset | Val MRR | Val NDCG@10 | Test MRR | Test NDCG@10 |
+|---|---:|---:|---:|---:|
+| `tgbn-trade` | 0.9102 | 0.3849 | 0.8635 | 0.3401 |
+| `tgbn-genre` | 0.6664 | 0.4263 | 0.6552 | 0.4139 |
+| `tgbn-reddit` | 0.4326 | 0.3413 | 0.4067 | 0.3098 |
+| `tgbn-token` | 0.2451 | 0.2303 | 0.2101 | 0.1935 |
+
+Logs:
+- `TGB2/logs/nodeprop_gat_real_20260129_063249/`
 
 ### A2) Existing RelBench datasets: entity prediction
 

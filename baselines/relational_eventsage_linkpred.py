@@ -5,11 +5,13 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import pickle
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
+import pandas as pd
 import pyarrow.parquet as pq
 import torch
 from torch import nn
@@ -97,6 +99,40 @@ def _load_edges_by_time(
 
     out = np.concatenate(edges, axis=0) if edges else np.zeros((0, 2), dtype=np.int64)
     return out, is_bipartite, n_src, n_dst
+
+
+def _load_official_task_edges(
+    *,
+    relbench_cache_root: Path,
+    dataset: str,
+    split: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    task_dir = relbench_cache_root / f"rel-tgb-{dataset}" / "tasks" / "src-dst-mrr"
+    df = pd.read_parquet(task_dir / f"{split}.parquet", columns=["src_id", "dst_id", "event_ts"])
+    ts_s = (pd.to_datetime(df["event_ts"], utc=True).astype("int64").to_numpy(copy=False) // 1_000_000_000).astype(
+        np.int64, copy=False
+    )
+    edges = df[["src_id", "dst_id"]].to_numpy(dtype=np.int64, copy=False)
+    return edges, ts_s
+
+
+def _load_official_negatives(
+    *,
+    relbench_cache_root: Path,
+    dataset: str,
+    split: str,
+) -> dict:
+    path = relbench_cache_root / f"rel-tgb-{dataset}" / "negatives" / f"{split}_ns.pkl"
+    with path.open("rb") as f:
+        return pickle.load(f)
+
+
+def _subsample_edges_and_ts(edges: np.ndarray, ts_s: np.ndarray, *, max_edges: Optional[int], seed: int) -> tuple[np.ndarray, np.ndarray]:
+    if max_edges is None or int(max_edges) <= 0 or edges.shape[0] <= int(max_edges):
+        return edges, ts_s
+    rng = np.random.default_rng(int(seed))
+    idx = rng.choice(edges.shape[0], size=int(max_edges), replace=False)
+    return edges[idx], ts_s[idx]
 
 
 class CSRAdjacency:
@@ -435,6 +471,126 @@ def _evaluate_mrr(
     return float((1.0 / rank.float()).mean().item())
 
 
+@torch.no_grad()
+def _evaluate_tgb_official(
+    model: RelEventSAGE,
+    adj_src_to_events: CSRAdjacency,
+    adj_dst_to_events: CSRAdjacency,
+    event_src: np.ndarray,
+    event_dst: np.ndarray,
+    event_ts_s: np.ndarray,
+    event_w: np.ndarray,
+    *,
+    edges: np.ndarray,
+    ts_s: np.ndarray,
+    neg_dict: dict,
+    ts_min_s: int,
+    ts_range_s: int,
+    is_bipartite: bool,
+    dst_offset: int,
+    device: torch.device,
+    fanout: int,
+    max_edges: int,
+    seed: int,
+    k_value: int = 10,
+) -> tuple[float, float]:
+    rng = np.random.default_rng(seed)
+    if edges.shape[0] == 0:
+        return float("nan"), float("nan")
+    if max_edges > 0 and edges.shape[0] > max_edges:
+        idx = rng.choice(edges.shape[0], size=max_edges, replace=False)
+        edges = edges[idx]
+        ts_s = ts_s[idx]
+
+    src = edges[:, 0].astype(np.int64, copy=False)
+    dst_local = edges[:, 1].astype(np.int64, copy=False)
+    dst_global = dst_local + int(dst_offset) if is_bipartite else dst_local
+
+    # Some datasets (notably tgbl-wiki-v2) can have per-example negative lists
+    # with slightly varying lengths, so we avoid assuming a fixed K.
+    neg_lists: list[np.ndarray] = []
+    lens = np.empty((edges.shape[0],), dtype=np.int64)
+    for i in range(edges.shape[0]):
+        key = (int(src[i]), int(dst_global[i]), int(ts_s[i]))
+        neg_g = np.asarray(neg_dict[key], dtype=np.int64)
+        if is_bipartite:
+            neg_l = neg_g - int(dst_offset)
+        else:
+            neg_l = neg_g
+        neg_l = neg_l.astype(np.int64, copy=False)
+        neg_lists.append(neg_l)
+        lens[i] = int(neg_l.shape[0])
+    neg_ptr = np.zeros((edges.shape[0] + 1,), dtype=np.int64)
+    np.cumsum(lens, out=neg_ptr[1:])
+    neg_flat = np.concatenate(neg_lists, axis=0) if neg_lists else np.zeros((0,), dtype=np.int64)
+    neg_row = np.repeat(np.arange(edges.shape[0], dtype=np.int64), lens.astype(np.int64, copy=False))
+
+    src_t = torch.from_numpy(src).to(device=device, dtype=torch.long)
+    pos_dst_t = torch.from_numpy(dst_local).to(device=device, dtype=torch.long)
+    neg_flat_t = torch.from_numpy(neg_flat).to(device=device, dtype=torch.long)
+    neg_row_t = torch.from_numpy(neg_row).to(device=device, dtype=torch.long)
+
+    z_src = model.encode_src(
+        src_t,
+        adj_src_to_events=adj_src_to_events,
+        event_src=event_src,
+        event_dst=event_dst,
+        event_ts_s=event_ts_s,
+        event_w=event_w,
+        ts_min_s=ts_min_s,
+        ts_range_s=ts_range_s,
+        fanout=fanout,
+        rng=rng,
+        device=device,
+    )
+    z_pos = model.encode_dst(
+        pos_dst_t,
+        adj_dst_to_events=adj_dst_to_events,
+        event_src=event_src,
+        event_dst=event_dst,
+        event_ts_s=event_ts_s,
+        event_w=event_w,
+        ts_min_s=ts_min_s,
+        ts_range_s=ts_range_s,
+        fanout=fanout,
+        rng=rng,
+        device=device,
+    )
+    pos_score = (z_src * z_pos).sum(dim=1)  # [N]
+
+    z_neg_flat = model.encode_dst(
+        neg_flat_t,
+        adj_dst_to_events=adj_dst_to_events,
+        event_src=event_src,
+        event_dst=event_dst,
+        event_ts_s=event_ts_s,
+        event_w=event_w,
+        ts_min_s=ts_min_s,
+        ts_range_s=ts_range_s,
+        fanout=fanout,
+        rng=rng,
+        device=device,
+    )  # [sumK, H]
+
+    neg_score_flat = (z_src[neg_row_t] * z_neg_flat).sum(dim=1)  # [sumK]
+    optimistic = torch.zeros((src_t.shape[0],), device=device, dtype=torch.float32)
+    pessimistic = torch.zeros((src_t.shape[0],), device=device, dtype=torch.float32)
+    for i in range(src_t.shape[0]):
+        start = int(neg_ptr[i])
+        end = int(neg_ptr[i + 1])
+        if end <= start:
+            continue
+        s = neg_score_flat[start:end]
+        p = pos_score[i]
+        optimistic[i] = (s > p).sum()
+        pessimistic[i] = (s >= p).sum()
+
+    rank = 0.5 * (optimistic + pessimistic) + 1.0
+    mrr = float((1.0 / rank).mean().item())
+    hits = float((rank <= float(int(k_value))).float().mean().item())
+    return mrr, hits
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Relational baseline (event-as-node PK/FK schema) for RelBench-exported TGB link datasets."
@@ -455,6 +611,17 @@ def main() -> None:
     parser.add_argument("--num_neg_train", type=int, default=1)
     parser.add_argument("--num_neg_eval", type=int, default=100)
     parser.add_argument("--max_eval_edges", type=int, default=20000)
+    parser.add_argument(
+        "--eval_mode",
+        default="sampled",
+        choices=["sampled", "tgb"],
+        help="Evaluation protocol: sampled negatives vs official TGB one-vs-many (requires relbench_cache_root).",
+    )
+    parser.add_argument(
+        "--relbench_cache_root",
+        default="/home/pc0618/tmp_relbench_cache_official",
+        help="Root containing prepared rel-tgb-* cache dirs (for eval_mode=tgb).",
+    )
     parser.add_argument("--parquet_batch_size", type=int, default=500000)
     parser.add_argument("--max_train_edges", type=int, default=None)
     parser.add_argument("--seed", type=int, default=1)
@@ -495,6 +662,7 @@ def main() -> None:
     config = {
         "dataset": args.dataset,
         "train_adj": args.train_adj,
+        "eval_mode": args.eval_mode,
         "fanout": args.fanout,
         "batch_size": args.batch_size,
         "emb_dim": args.emb_dim,
@@ -593,35 +761,65 @@ def main() -> None:
 
         # Eval val/test.
         model.eval()
-        val_edges, _, _, _ = _load_edges_by_time(
-            exports_root,
-            args.dataset,
-            start_s_exclusive=meta.val_timestamp_s,
-            end_s_inclusive=meta.test_timestamp_s,
-            parquet_batch_size=int(args.parquet_batch_size),
-            max_edges=int(args.max_eval_edges),
-            seed=int(args.seed) + 7,
-        )
-        val_mrr = _evaluate_mrr(
-            model,
-            adj_src_train,
-            adj_dst_train,
-            np.asarray(event_src_train),
-            np.asarray(event_dst_train),
-            np.asarray(event_ts_train),
-            np.asarray(event_w_train),
-            edges=val_edges,
-            ts_min_s=ts_min_s,
-            ts_range_s=ts_range_s,
-            num_neg=int(args.num_neg_eval),
-            num_dst=num_dst_nodes,
-            device=device,
-            fanout=int(args.fanout),
-            max_edges=int(args.max_eval_edges),
-            seed=int(args.seed) + 13 + epoch,
-        )
+        if args.eval_mode == "tgb":
+            relbench_cache_root = Path(args.relbench_cache_root)
+            val_edges, val_ts_s = _load_official_task_edges(relbench_cache_root=relbench_cache_root, dataset=args.dataset, split="val")
+            test_edges, test_ts_s = _load_official_task_edges(relbench_cache_root=relbench_cache_root, dataset=args.dataset, split="test")
+            val_neg = _load_official_negatives(relbench_cache_root=relbench_cache_root, dataset=args.dataset, split="val")
+            test_neg = _load_official_negatives(relbench_cache_root=relbench_cache_root, dataset=args.dataset, split="test")
+
+            val_mrr, val_hits = _evaluate_tgb_official(
+                model,
+                adj_src_train,
+                adj_dst_train,
+                np.asarray(event_src_train),
+                np.asarray(event_dst_train),
+                np.asarray(event_ts_train),
+                np.asarray(event_w_train),
+                edges=val_edges,
+                ts_s=val_ts_s,
+                neg_dict=val_neg,
+                ts_min_s=ts_min_s,
+                ts_range_s=ts_range_s,
+                is_bipartite=is_bipartite,
+                dst_offset=n_src,
+                device=device,
+                fanout=int(args.fanout),
+                max_edges=int(args.max_eval_edges),
+                seed=int(args.seed) + 13 + epoch,
+                k_value=10,
+            )
+        else:
+            val_edges, _, _, _ = _load_edges_by_time(
+                exports_root,
+                args.dataset,
+                start_s_exclusive=meta.val_timestamp_s,
+                end_s_inclusive=meta.test_timestamp_s,
+                parquet_batch_size=int(args.parquet_batch_size),
+                max_edges=int(args.max_eval_edges),
+                seed=int(args.seed) + 7,
+            )
+            val_mrr = _evaluate_mrr(
+                model,
+                adj_src_train,
+                adj_dst_train,
+                np.asarray(event_src_train),
+                np.asarray(event_dst_train),
+                np.asarray(event_ts_train),
+                np.asarray(event_w_train),
+                edges=val_edges,
+                ts_min_s=ts_min_s,
+                ts_range_s=ts_range_s,
+                num_neg=int(args.num_neg_eval),
+                num_dst=num_dst_nodes,
+                device=device,
+                fanout=int(args.fanout),
+                max_edges=int(args.max_eval_edges),
+                seed=int(args.seed) + 13 + epoch,
+            )
 
         test_mrr = float("nan")
+        test_hits = float("nan")
         try:
             test_suffix = _suffix_from_adj_arg(meta, args.eval_adj_test)
             (adj_src_test, adj_dst_test, event_src_test, event_dst_test, event_ts_test, event_w_test) = _load_rel_event_arrays(
@@ -630,39 +828,79 @@ def main() -> None:
             ts_min_t = int(np.min(event_ts_test)) if event_ts_test.size else ts_min_s
             ts_max_t = int(np.max(event_ts_test)) if event_ts_test.size else ts_max_s
             ts_range_t = max(1, ts_max_t - ts_min_t)
-            test_edges, _, _, _ = _load_edges_by_time(
-                exports_root,
-                args.dataset,
-                start_s_exclusive=meta.test_timestamp_s,
-                end_s_inclusive=None,
-                parquet_batch_size=int(args.parquet_batch_size),
-                max_edges=int(args.max_eval_edges),
-                seed=int(args.seed) + 9,
-            )
-            test_mrr = _evaluate_mrr(
-                model,
-                adj_src_test,
-                adj_dst_test,
-                np.asarray(event_src_test),
-                np.asarray(event_dst_test),
-                np.asarray(event_ts_test),
-                np.asarray(event_w_test),
-                edges=test_edges,
-                ts_min_s=ts_min_t,
-                ts_range_s=ts_range_t,
-                num_neg=int(args.num_neg_eval),
-                num_dst=num_dst_nodes,
-                device=device,
-                fanout=int(args.fanout),
-                max_edges=int(args.max_eval_edges),
-                seed=int(args.seed) + 17 + epoch,
-            )
+            if args.eval_mode == "tgb":
+                test_mrr, test_hits = _evaluate_tgb_official(
+                    model,
+                    adj_src_test,
+                    adj_dst_test,
+                    np.asarray(event_src_test),
+                    np.asarray(event_dst_test),
+                    np.asarray(event_ts_test),
+                    np.asarray(event_w_test),
+                    edges=test_edges,
+                    ts_s=test_ts_s,
+                    neg_dict=test_neg,
+                    ts_min_s=ts_min_t,
+                    ts_range_s=ts_range_t,
+                    is_bipartite=is_bipartite,
+                    dst_offset=n_src,
+                    device=device,
+                    fanout=int(args.fanout),
+                    max_edges=int(args.max_eval_edges),
+                    seed=int(args.seed) + 17 + epoch,
+                    k_value=10,
+                )
+            else:
+                test_edges2, _, _, _ = _load_edges_by_time(
+                    exports_root,
+                    args.dataset,
+                    start_s_exclusive=meta.test_timestamp_s,
+                    end_s_inclusive=None,
+                    parquet_batch_size=int(args.parquet_batch_size),
+                    max_edges=int(args.max_eval_edges),
+                    seed=int(args.seed) + 9,
+                )
+                test_mrr = _evaluate_mrr(
+                    model,
+                    adj_src_test,
+                    adj_dst_test,
+                    np.asarray(event_src_test),
+                    np.asarray(event_dst_test),
+                    np.asarray(event_ts_test),
+                    np.asarray(event_w_test),
+                    edges=test_edges2,
+                    ts_min_s=ts_min_t,
+                    ts_range_s=ts_range_t,
+                    num_neg=int(args.num_neg_eval),
+                    num_dst=num_dst_nodes,
+                    device=device,
+                    fanout=int(args.fanout),
+                    max_edges=int(args.max_eval_edges),
+                    seed=int(args.seed) + 17 + epoch,
+                )
         except FileNotFoundError:
             pass
 
-        print(f"epoch={epoch} loss={avg_loss:.4f} val_mrr={val_mrr:.4f} test_mrr={test_mrr:.4f}")
-        if wb is not None:
-            wb.log({"epoch": epoch, "loss": avg_loss, "val_mrr": val_mrr, "test_mrr": test_mrr})
+        if args.eval_mode == "tgb":
+            print(
+                f"epoch={epoch} loss={avg_loss:.4f} val_mrr={val_mrr:.4f} val_hits@10={val_hits:.4f} "
+                f"test_mrr={test_mrr:.4f} test_hits@10={test_hits:.4f}"
+            )
+            if wb is not None:
+                wb.log(
+                    {
+                        "epoch": epoch,
+                        "loss": avg_loss,
+                        "val_mrr": val_mrr,
+                        "val_hits@10": val_hits,
+                        "test_mrr": test_mrr,
+                        "test_hits@10": test_hits,
+                    }
+                )
+        else:
+            print(f"epoch={epoch} loss={avg_loss:.4f} val_mrr={val_mrr:.4f} test_mrr={test_mrr:.4f}")
+            if wb is not None:
+                wb.log({"epoch": epoch, "loss": avg_loss, "val_mrr": val_mrr, "test_mrr": test_mrr})
 
     if args.save_dir:
         save_dir = Path(args.save_dir)

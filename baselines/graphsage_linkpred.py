@@ -5,11 +5,13 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import pickle
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
+import pandas as pd
 import pyarrow.parquet as pq
 import torch
 from torch import nn
@@ -98,6 +100,40 @@ def _load_edges_by_time(
     return out, is_bipartite, n_src, n_dst
 
 
+def _load_official_task_edges(
+    *,
+    relbench_cache_root: Path,
+    dataset: str,
+    split: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    task_dir = relbench_cache_root / f"rel-tgb-{dataset}" / "tasks" / "src-dst-mrr"
+    df = pd.read_parquet(task_dir / f"{split}.parquet", columns=["src_id", "dst_id", "event_ts"])
+    ts_s = (pd.to_datetime(df["event_ts"], utc=True).astype("int64").to_numpy(copy=False) // 1_000_000_000).astype(
+        np.int64, copy=False
+    )
+    edges = df[["src_id", "dst_id"]].to_numpy(dtype=np.int64, copy=False)
+    return edges, ts_s
+
+
+def _load_official_negatives(
+    *,
+    relbench_cache_root: Path,
+    dataset: str,
+    split: str,
+) -> dict:
+    path = relbench_cache_root / f"rel-tgb-{dataset}" / "negatives" / f"{split}_ns.pkl"
+    with path.open("rb") as f:
+        return pickle.load(f)
+
+
+def _subsample_edges_and_ts(edges: np.ndarray, ts_s: np.ndarray, *, max_edges: Optional[int], seed: int) -> tuple[np.ndarray, np.ndarray]:
+    if max_edges is None or int(max_edges) <= 0 or edges.shape[0] <= int(max_edges):
+        return edges, ts_s
+    rng = np.random.default_rng(int(seed))
+    idx = rng.choice(edges.shape[0], size=int(max_edges), replace=False)
+    return edges[idx], ts_s[idx]
+
+
 class CSRAdjacency:
     def __init__(self, indptr: np.ndarray, indices: np.ndarray):
         self.indptr = indptr
@@ -178,6 +214,122 @@ class SampledGraphSAGE(nn.Module):
         return out
 
 
+class _GATLayer(nn.Module):
+    def __init__(
+        self,
+        *,
+        self_in_dim: int,
+        neigh_in_dim: int,
+        out_dim: int,
+        num_heads: int,
+        attn_dropout: float,
+    ):
+        super().__init__()
+        if out_dim % num_heads != 0:
+            raise ValueError(f"out_dim={out_dim} must be divisible by num_heads={num_heads}")
+        self.out_dim = int(out_dim)
+        self.num_heads = int(num_heads)
+        self.head_dim = int(out_dim // num_heads)
+        self.scale = float(self.head_dim) ** -0.5
+
+        self.lin_q = nn.Linear(self_in_dim, out_dim, bias=False)
+        self.lin_k = nn.Linear(neigh_in_dim, out_dim, bias=False)
+        self.lin_v = nn.Linear(neigh_in_dim, out_dim, bias=False)
+        self.lin_self = nn.Linear(self_in_dim, out_dim, bias=False)
+        self.drop_attn = nn.Dropout(float(attn_dropout))
+
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        for m in (self.lin_q, self.lin_k, self.lin_v, self.lin_self):
+            nn.init.xavier_uniform_(m.weight)
+
+    def forward(self, h_self: torch.Tensor, h_neigh: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            h_self: [N, D_self]
+            h_neigh: [N, fanout, D_neigh]
+        Returns:
+            out: [N, out_dim]
+        """
+        n = h_self.size(0)
+        fanout = h_neigh.size(1)
+
+        q = self.lin_q(h_self).view(n, self.num_heads, self.head_dim)  # [N,H,K]
+        k = self.lin_k(h_neigh).view(n, fanout, self.num_heads, self.head_dim)  # [N,F,H,K]
+        v = self.lin_v(h_neigh).view(n, fanout, self.num_heads, self.head_dim)
+
+        scores = (k * q.unsqueeze(1)).sum(dim=-1) * self.scale  # [N,F,H]
+        attn = torch.softmax(scores, dim=1)  # [N,F,H]
+        attn = self.drop_attn(attn)
+
+        agg = (attn.unsqueeze(-1) * v).sum(dim=1)  # [N,H,K]
+        agg = agg.reshape(n, self.out_dim)
+        out = self.lin_self(h_self) + agg
+        return out
+
+
+class SampledGAT(nn.Module):
+    def __init__(
+        self,
+        *,
+        num_nodes: int,
+        emb_dim: int,
+        hidden_dim: int,
+        fanouts: tuple[int, int],
+        dropout: float,
+        num_heads: int,
+        attn_dropout: float,
+    ):
+        super().__init__()
+        self.emb = nn.Embedding(int(num_nodes), int(emb_dim))
+        self.fanouts = fanouts
+        self.gat1 = _GATLayer(
+            self_in_dim=int(emb_dim),
+            neigh_in_dim=int(emb_dim),
+            out_dim=int(hidden_dim),
+            num_heads=int(num_heads),
+            attn_dropout=float(attn_dropout),
+        )
+        self.gat2 = _GATLayer(
+            self_in_dim=int(emb_dim),
+            neigh_in_dim=int(hidden_dim),
+            out_dim=int(hidden_dim),
+            num_heads=int(num_heads),
+            attn_dropout=float(attn_dropout),
+        )
+        self.act = nn.ReLU()
+        self.drop = nn.Dropout(float(dropout))
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.normal_(self.emb.weight, std=0.02)
+        self.gat1.reset_parameters()
+        self.gat2.reset_parameters()
+
+    def encode(self, seeds: torch.Tensor, adj: CSRAdjacency, rng: np.random.Generator, device: torch.device) -> torch.Tensor:
+        fan1, fan2 = self.fanouts
+        seeds_np = seeds.detach().cpu().numpy().astype(np.int64, copy=False)
+
+        nbr1 = adj.sample_neighbors(seeds_np, fan1, rng=rng)  # [B, fan1]
+        nbr1_flat = nbr1.reshape(-1)
+        nbr2 = adj.sample_neighbors(nbr1_flat, fan2, rng=rng)  # [B*fan1, fan2]
+
+        nbr2_t = torch.from_numpy(nbr2).to(device=device, dtype=torch.long)
+        nbr1_t = torch.from_numpy(nbr1_flat).to(device=device, dtype=torch.long)
+
+        h2 = self.emb(nbr2_t)  # [B*fan1, fan2, D]
+        h1_self = self.emb(nbr1_t)  # [B*fan1, D]
+        h1 = self.act(self.gat1(h1_self, h2))  # [B*fan1, H]
+        h1 = self.drop(h1)
+
+        h1 = h1.view(seeds.shape[0], fan1, -1)  # [B, fan1, H]
+        h0 = self.emb(seeds.to(device))  # [B, D]
+        out = self.act(self.gat2(h0, h1))  # [B, H]
+        out = self.drop(out)
+        return out
+
+
 def _maybe_init_wandb(args, config: dict):
     if not args.wandb or args.wandb_mode == "disabled":
         return None
@@ -196,7 +348,7 @@ def _maybe_init_wandb(args, config: dict):
 
 @torch.no_grad()
 def _evaluate_mrr(
-    model: SampledGraphSAGE,
+    model: nn.Module,
     adj: CSRAdjacency,
     edges: np.ndarray,
     *,
@@ -232,6 +384,78 @@ def _evaluate_mrr(
     return float((1.0 / rank.float()).mean().item())
 
 
+@torch.no_grad()
+def _evaluate_tgb_official(
+    model: nn.Module,
+    adj: CSRAdjacency,
+    edges: np.ndarray,
+    ts_s: np.ndarray,
+    neg_dict: dict,
+    *,
+    dst_offset: int,
+    device: torch.device,
+    max_edges: int,
+    seed: int,
+    k_value: int = 10,
+) -> tuple[float, float]:
+    """Official TGB one-vs-many MRR/Hits@k using provided negatives."""
+    rng = np.random.default_rng(seed)
+    if edges.shape[0] == 0:
+        return float("nan"), float("nan")
+    if max_edges > 0 and edges.shape[0] > max_edges:
+        idx = rng.choice(edges.shape[0], size=max_edges, replace=False)
+        edges = edges[idx]
+        ts_s = ts_s[idx]
+
+    src = edges[:, 0].astype(np.int64, copy=False)
+    dst_local = edges[:, 1].astype(np.int64, copy=False)
+    dst_global = dst_local + int(dst_offset) if dst_offset else dst_local
+
+    src_t = torch.from_numpy(src).to(device=device, dtype=torch.long)
+    pos_t = torch.from_numpy(dst_global).to(device=device, dtype=torch.long)
+
+    # Some datasets can have per-example negative lists with slightly varying
+    # lengths, so we avoid assuming a fixed K.
+    neg_lists: list[np.ndarray] = []
+    lens = np.empty((edges.shape[0],), dtype=np.int64)
+    for i in range(edges.shape[0]):
+        key = (int(src[i]), int(dst_global[i]), int(ts_s[i]))
+        neg_g = np.asarray(neg_dict[key], dtype=np.int64)
+        neg_g = neg_g.astype(np.int64, copy=False)
+        neg_lists.append(neg_g)
+        lens[i] = int(neg_g.shape[0])
+    neg_ptr = np.zeros((edges.shape[0] + 1,), dtype=np.int64)
+    np.cumsum(lens, out=neg_ptr[1:])
+    neg_flat = np.concatenate(neg_lists, axis=0) if neg_lists else np.zeros((0,), dtype=np.int64)
+    neg_row = np.repeat(np.arange(edges.shape[0], dtype=np.int64), lens.astype(np.int64, copy=False))
+    neg_flat_t = torch.from_numpy(neg_flat).to(device=device, dtype=torch.long)
+    neg_row_t = torch.from_numpy(neg_row).to(device=device, dtype=torch.long)
+
+    z_src = model.encode(src_t, adj, rng=rng, device=device)
+    z_pos = model.encode(pos_t, adj, rng=rng, device=device)
+    pos_score = (z_src * z_pos).sum(dim=1)  # [B]
+
+    z_neg_flat = model.encode(neg_flat_t, adj, rng=rng, device=device)  # [sumK,H]
+    neg_score_flat = (z_src[neg_row_t] * z_neg_flat).sum(dim=1)  # [sumK]
+    optimistic = torch.zeros((src_t.shape[0],), device=device, dtype=torch.float32)
+    pessimistic = torch.zeros((src_t.shape[0],), device=device, dtype=torch.float32)
+    for i in range(src_t.shape[0]):
+        start = int(neg_ptr[i])
+        end = int(neg_ptr[i + 1])
+        if end <= start:
+            continue
+        s = neg_score_flat[start:end]
+        p = pos_score[i]
+        optimistic[i] = (s > p).sum()
+        pessimistic[i] = (s >= p).sum()
+
+    rank = 0.5 * (optimistic + pessimistic) + 1.0
+
+    mrr = float((1.0 / rank).mean().item())
+    hits = float((rank <= float(int(k_value))).float().mean().item())
+    return mrr, hits
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Sampled GraphSAGE baseline for RelBench-exported TGB link datasets.")
     parser.add_argument("--dataset", required=True)
@@ -239,6 +463,7 @@ def main() -> None:
     parser.add_argument("--adj", default="val", help="Which CSR adjacency to use: val | test | all | <unix_seconds>")
     parser.add_argument("--undirected", action="store_true")
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--model", default="sage", choices=["sage", "gat"])
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=1e-2)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
@@ -246,10 +471,23 @@ def main() -> None:
     parser.add_argument("--hidden_dim", type=int, default=64)
     parser.add_argument("--fanouts", default="15,10", help="fanout1,fanout2")
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--num_heads", type=int, default=4, help="GAT heads (requires hidden_dim divisible by num_heads).")
+    parser.add_argument("--attn_dropout", type=float, default=0.1, help="Dropout on attention weights (GAT only).")
     parser.add_argument("--batch_size", type=int, default=2048)
     parser.add_argument("--num_neg_train", type=int, default=1)
     parser.add_argument("--num_neg_eval", type=int, default=100)
     parser.add_argument("--max_eval_edges", type=int, default=20000)
+    parser.add_argument(
+        "--eval_mode",
+        default="sampled",
+        choices=["sampled", "tgb"],
+        help="Evaluation protocol: sampled negatives vs official TGB one-vs-many (requires relbench_cache_root).",
+    )
+    parser.add_argument(
+        "--relbench_cache_root",
+        default="/home/pc0618/tmp_relbench_cache_official",
+        help="Root containing prepared rel-tgb-* cache dirs (for eval_mode=tgb).",
+    )
     parser.add_argument("--parquet_batch_size", type=int, default=500000)
     parser.add_argument("--max_train_edges", type=int, default=None)
     parser.add_argument("--max_val_edges", type=int, default=None)
@@ -289,18 +527,28 @@ def main() -> None:
     adj_dir = exports_root / args.dataset / "adj"
     indptr_path = adj_dir / f"csr_indptr_{suffix}.npy"
     indices_path = adj_dir / f"csr_indices_{suffix}.npy"
-    if not indptr_path.exists() or not indices_path.exists():
-        undirected_flag = "--undirected" if args.undirected else ""
-        raise FileNotFoundError(
-            f"Missing CSR adjacency. Build it first with: "
-            f"scripts/build_csr_adj.py --dataset {args.dataset} --exports_root {args.exports_root} "
-            f"--upto {args.adj} {undirected_flag}"
-        )
-    adj = CSRAdjacency.load(indptr_path, indices_path)
+    adj: Optional[CSRAdjacency] = None
 
     fan1, fan2 = (int(x) for x in args.fanouts.split(","))
     device = torch.device(args.device)
-    model = SampledGraphSAGE(num_nodes=num_nodes, emb_dim=args.emb_dim, hidden_dim=args.hidden_dim, fanouts=(fan1, fan2), dropout=args.dropout).to(device)
+    if args.model == "sage":
+        model = SampledGraphSAGE(
+            num_nodes=num_nodes,
+            emb_dim=args.emb_dim,
+            hidden_dim=args.hidden_dim,
+            fanouts=(fan1, fan2),
+            dropout=args.dropout,
+        ).to(device)
+    else:
+        model = SampledGAT(
+            num_nodes=num_nodes,
+            emb_dim=args.emb_dim,
+            hidden_dim=args.hidden_dim,
+            fanouts=(fan1, fan2),
+            dropout=args.dropout,
+            num_heads=int(args.num_heads),
+            attn_dropout=float(args.attn_dropout),
+        ).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     bce = nn.BCEWithLogitsLoss()
 
@@ -318,38 +566,95 @@ def main() -> None:
             "batch_size": args.batch_size,
             "neg_train": args.num_neg_train,
             "neg_eval": args.num_neg_eval,
+            "eval_mode": args.eval_mode,
             "adj": args.adj,
             "undirected": args.undirected,
+            "model": args.model,
+            "num_heads": int(args.num_heads) if args.model == "gat" else None,
+            "attn_dropout": float(args.attn_dropout) if args.model == "gat" else None,
         },
     )
 
-    train_edges, *_ = _load_edges_by_time(
-        exports_root,
-        args.dataset,
-        start_s_exclusive=None,
-        end_s_inclusive=meta.val_timestamp_s,
-        parquet_batch_size=args.parquet_batch_size,
-        max_edges=args.max_train_edges,
-        seed=args.seed + 10,
-    )
-    val_edges, *_ = _load_edges_by_time(
-        exports_root,
-        args.dataset,
-        start_s_exclusive=meta.val_timestamp_s,
-        end_s_inclusive=meta.test_timestamp_s,
-        parquet_batch_size=args.parquet_batch_size,
-        max_edges=args.max_val_edges,
-        seed=args.seed + 20,
-    )
-    test_edges, *_ = _load_edges_by_time(
-        exports_root,
-        args.dataset,
-        start_s_exclusive=meta.test_timestamp_s,
-        end_s_inclusive=None,
-        parquet_batch_size=args.parquet_batch_size,
-        max_edges=args.max_test_edges,
-        seed=args.seed + 30,
-    )
+    if args.eval_mode == "tgb":
+        relbench_cache_root = Path(args.relbench_cache_root)
+        train_edges, train_ts_s = _load_official_task_edges(
+            relbench_cache_root=relbench_cache_root, dataset=args.dataset, split="train"
+        )
+        val_edges, val_ts_s = _load_official_task_edges(
+            relbench_cache_root=relbench_cache_root, dataset=args.dataset, split="val"
+        )
+        test_edges, test_ts_s = _load_official_task_edges(
+            relbench_cache_root=relbench_cache_root, dataset=args.dataset, split="test"
+        )
+        train_edges, train_ts_s = _subsample_edges_and_ts(
+            train_edges, train_ts_s, max_edges=args.max_train_edges, seed=args.seed + 10
+        )
+        val_edges, val_ts_s = _subsample_edges_and_ts(val_edges, val_ts_s, max_edges=args.max_val_edges, seed=args.seed + 20)
+        test_edges, test_ts_s = _subsample_edges_and_ts(
+            test_edges, test_ts_s, max_edges=args.max_test_edges, seed=args.seed + 30
+        )
+        val_neg = _load_official_negatives(relbench_cache_root=relbench_cache_root, dataset=args.dataset, split="val")
+        test_neg = _load_official_negatives(
+            relbench_cache_root=relbench_cache_root, dataset=args.dataset, split="test"
+        )
+    else:
+        train_edges, *_ = _load_edges_by_time(
+            exports_root,
+            args.dataset,
+            start_s_exclusive=None,
+            end_s_inclusive=meta.val_timestamp_s,
+            parquet_batch_size=args.parquet_batch_size,
+            max_edges=args.max_train_edges,
+            seed=args.seed + 10,
+        )
+        val_edges, *_ = _load_edges_by_time(
+            exports_root,
+            args.dataset,
+            start_s_exclusive=meta.val_timestamp_s,
+            end_s_inclusive=meta.test_timestamp_s,
+            parquet_batch_size=args.parquet_batch_size,
+            max_edges=args.max_val_edges,
+            seed=args.seed + 20,
+        )
+        test_edges, *_ = _load_edges_by_time(
+            exports_root,
+            args.dataset,
+            start_s_exclusive=meta.test_timestamp_s,
+            end_s_inclusive=None,
+            parquet_batch_size=args.parquet_batch_size,
+            max_edges=args.max_test_edges,
+            seed=args.seed + 30,
+        )
+        train_ts_s = val_ts_s = test_ts_s = None
+        val_neg = test_neg = None
+
+    if adj is None:
+        if indptr_path.exists() and indices_path.exists():
+            adj = CSRAdjacency.load(indptr_path, indices_path)
+        else:
+            # Build a small in-memory adjacency from the (possibly capped) training edges.
+            # This keeps the script runnable without precomputing CSR files.
+            edges_for_adj = train_edges.astype(np.int64, copy=False)
+            src_ids = edges_for_adj[:, 0]
+            dst_ids = edges_for_adj[:, 1] + int(dst_offset) if dst_offset else edges_for_adj[:, 1]
+            if args.undirected:
+                src_all = np.concatenate([src_ids, dst_ids], axis=0)
+                dst_all = np.concatenate([dst_ids, src_ids], axis=0)
+            else:
+                src_all = src_ids
+                dst_all = dst_ids
+
+            deg = np.bincount(src_all, minlength=int(num_nodes)).astype(np.int64, copy=False)
+            indptr = np.empty((int(num_nodes) + 1,), dtype=np.int64)
+            indptr[0] = 0
+            np.cumsum(deg, out=indptr[1:])
+            indices = np.empty((int(indptr[-1]),), dtype=np.int64)
+            cur = indptr[:-1].copy()
+            for s, d in zip(src_all.tolist(), dst_all.tolist()):
+                j = cur[s]
+                indices[j] = int(d)
+                cur[s] += 1
+            adj = CSRAdjacency(indptr=indptr, indices=indices)
 
     if train_edges.shape[0] == 0:
         raise RuntimeError("No training edges found. Check cutoffs.")
@@ -386,33 +691,79 @@ def main() -> None:
 
         model.eval()
         with torch.no_grad():
-            val_mrr = _evaluate_mrr(
-                model,
-                adj,
-                val_edges,
-                num_neg=args.num_neg_eval,
-                num_dst=num_dst,
-                dst_offset=dst_offset,
-                device=device,
-                max_edges=args.max_eval_edges,
-                seed=args.seed + 2000 + epoch,
-            )
-            test_mrr = _evaluate_mrr(
-                model,
-                adj,
-                test_edges,
-                num_neg=args.num_neg_eval,
-                num_dst=num_dst,
-                dst_offset=dst_offset,
-                device=device,
-                max_edges=args.max_eval_edges,
-                seed=args.seed + 3000 + epoch,
-            )
+            if args.eval_mode == "tgb":
+                val_mrr, val_hits = _evaluate_tgb_official(
+                    model,
+                    adj,
+                    val_edges,
+                    val_ts_s,
+                    val_neg,
+                    dst_offset=dst_offset,
+                    device=device,
+                    max_edges=args.max_eval_edges,
+                    seed=args.seed + 2000 + epoch,
+                    k_value=10,
+                )
+                test_mrr, test_hits = _evaluate_tgb_official(
+                    model,
+                    adj,
+                    test_edges,
+                    test_ts_s,
+                    test_neg,
+                    dst_offset=dst_offset,
+                    device=device,
+                    max_edges=args.max_eval_edges,
+                    seed=args.seed + 3000 + epoch,
+                    k_value=10,
+                )
+            else:
+                val_mrr = _evaluate_mrr(
+                    model,
+                    adj,
+                    val_edges,
+                    num_neg=args.num_neg_eval,
+                    num_dst=num_dst,
+                    dst_offset=dst_offset,
+                    device=device,
+                    max_edges=args.max_eval_edges,
+                    seed=args.seed + 2000 + epoch,
+                )
+                test_mrr = _evaluate_mrr(
+                    model,
+                    adj,
+                    test_edges,
+                    num_neg=args.num_neg_eval,
+                    num_dst=num_dst,
+                    dst_offset=dst_offset,
+                    device=device,
+                    max_edges=args.max_eval_edges,
+                    seed=args.seed + 3000 + epoch,
+                )
 
         avg_loss = epoch_loss / steps_per_epoch
-        print(f"epoch={epoch} loss={avg_loss:.4f} val_mrr@{args.num_neg_eval}={val_mrr:.4f} test_mrr@{args.num_neg_eval}={test_mrr:.4f}")
-        if run is not None:
-            run.log({"epoch": epoch, "loss": avg_loss, "val_mrr": val_mrr, "test_mrr": test_mrr})
+        if args.eval_mode == "tgb":
+            print(
+                f"epoch={epoch} loss={avg_loss:.4f} val_mrr={val_mrr:.4f} val_hits@10={val_hits:.4f} "
+                f"test_mrr={test_mrr:.4f} test_hits@10={test_hits:.4f}"
+            )
+            if run is not None:
+                run.log(
+                    {
+                        "epoch": epoch,
+                        "loss": avg_loss,
+                        "val_mrr": val_mrr,
+                        "val_hits@10": val_hits,
+                        "test_mrr": test_mrr,
+                        "test_hits@10": test_hits,
+                    }
+                )
+        else:
+            print(
+                f"epoch={epoch} loss={avg_loss:.4f} val_mrr@{args.num_neg_eval}={val_mrr:.4f} "
+                f"test_mrr@{args.num_neg_eval}={test_mrr:.4f}"
+            )
+            if run is not None:
+                run.log({"epoch": epoch, "loss": avg_loss, "val_mrr": val_mrr, "test_mrr": test_mrr})
 
     if run is not None:
         run.finish()

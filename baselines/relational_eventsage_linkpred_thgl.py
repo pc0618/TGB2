@@ -5,12 +5,14 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import pickle
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
+import pandas as pd
 import pyarrow.parquet as pq
 import torch
 from torch import nn
@@ -165,6 +167,230 @@ def _load_edges_by_time_thgl(
         dst_all = dst_all[idx]
 
     return src_t_all, dst_t_all, et_all, src_all, dst_all
+
+
+def _load_thgl_mappings(*, relbench_cache_root: Path, dataset: str) -> tuple[np.ndarray, np.ndarray, dict[int, np.ndarray]]:
+    ds_dir = relbench_cache_root / f"rel-tgb-{dataset}" / "mappings"
+    node_type = np.load(ds_dir / "node_type.npy", mmap_mode="r")
+    local_id = np.load(ds_dir / "local_id.npy", mmap_mode="r")
+    globals_by_type: dict[int, np.ndarray] = {}
+    for p in sorted(ds_dir.glob("globals_type_*.npy")):
+        m = re.fullmatch(r"globals_type_(\d+)\.npy", p.name)
+        if not m:
+            continue
+        t = int(m.group(1))
+        globals_by_type[t] = np.load(p, mmap_mode="r")
+    return node_type, local_id, globals_by_type
+
+
+def _load_thgl_negatives(*, relbench_cache_root: Path, dataset: str, split: str) -> dict:
+    path = relbench_cache_root / f"rel-tgb-{dataset}" / "negatives" / f"{split}_ns.pkl"
+    with path.open("rb") as f:
+        return pickle.load(f)
+
+
+def _load_official_edges_thgl(
+    *,
+    relbench_cache_root: Path,
+    dataset: str,
+    split: str,
+    max_edges: int,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Load a sampled set of (typed) thgl edges from prepared task tables."""
+    rng = np.random.default_rng(int(seed))
+    ds_root = relbench_cache_root / f"rel-tgb-{dataset}" / "tasks"
+    task_dirs = sorted(ds_root.glob("edge-type-*-mrr"))
+    if not task_dirs:
+        raise FileNotFoundError(f"No thgl task dirs found under {ds_root}")
+
+    src_types: list[np.ndarray] = []
+    dst_types: list[np.ndarray] = []
+    edge_types: list[np.ndarray] = []
+    src_ids: list[np.ndarray] = []
+    dst_ids: list[np.ndarray] = []
+    ts_s_list: list[np.ndarray] = []
+
+    remaining = int(max_edges) if int(max_edges) > 0 else None
+    for td in task_dirs:
+        m = re.fullmatch(r"edge-type-(\d+)-mrr", td.name)
+        if not m:
+            continue
+        et = int(m.group(1))
+        pq_path = td / f"{split}.parquet"
+        if not pq_path.exists():
+            continue
+
+        md = _read_relbench_parquet_metadata(pq_path)
+        fkeys = md.get("fkey_col_to_pkey_table")
+        if not isinstance(fkeys, dict):
+            raise RuntimeError(f"Missing RelBench metadata on {pq_path}")
+        src_tbl = fkeys.get("src_id")
+        dst_tbl = fkeys.get("dst_id")
+        if not isinstance(src_tbl, str) or not isinstance(dst_tbl, str):
+            raise RuntimeError(f"Malformed fkey metadata on {pq_path}: {fkeys}")
+        src_t = _parse_node_type_from_table_name(src_tbl)
+        dst_t = _parse_node_type_from_table_name(dst_tbl)
+
+        df = pd.read_parquet(pq_path, columns=["src_id", "dst_id", "event_ts"])
+        if df.shape[0] == 0:
+            continue
+        if remaining is not None and df.shape[0] > remaining:
+            idx = rng.choice(df.shape[0], size=remaining, replace=False)
+            df = df.iloc[idx]
+
+        ts_s = (pd.to_datetime(df["event_ts"], utc=True).astype("int64").to_numpy(copy=False) // 1_000_000_000).astype(
+            np.int64, copy=False
+        )
+        s = df["src_id"].to_numpy(dtype=np.int64, copy=False)
+        d = df["dst_id"].to_numpy(dtype=np.int64, copy=False)
+
+        k = int(s.shape[0])
+        src_types.append(np.full(k, src_t, dtype=np.int16))
+        dst_types.append(np.full(k, dst_t, dtype=np.int16))
+        edge_types.append(np.full(k, et, dtype=np.int16))
+        src_ids.append(s)
+        dst_ids.append(d)
+        ts_s_list.append(ts_s)
+
+        if remaining is not None:
+            remaining -= k
+            if remaining <= 0:
+                break
+
+    if not src_ids:
+        return (
+            np.zeros((0,), dtype=np.int16),
+            np.zeros((0,), dtype=np.int16),
+            np.zeros((0,), dtype=np.int16),
+            np.zeros((0,), dtype=np.int64),
+            np.zeros((0,), dtype=np.int64),
+            np.zeros((0,), dtype=np.int64),
+        )
+
+    return (
+        np.concatenate(src_types, axis=0),
+        np.concatenate(dst_types, axis=0),
+        np.concatenate(edge_types, axis=0),
+        np.concatenate(src_ids, axis=0),
+        np.concatenate(dst_ids, axis=0),
+        np.concatenate(ts_s_list, axis=0),
+    )
+
+
+@torch.no_grad()
+def _evaluate_tgb_official_thgl(
+    model: "HeteroRelEventSAGE",
+    ev_arrays: ThglAdj,
+    *,
+    src_type: np.ndarray,
+    dst_type: np.ndarray,
+    edge_type: np.ndarray,
+    src_id: np.ndarray,
+    dst_id: np.ndarray,
+    ts_s: np.ndarray,
+    neg_dict: dict,
+    node_type: np.ndarray,
+    local_id: np.ndarray,
+    globals_by_type: dict[int, np.ndarray],
+    ts_min_s: int,
+    ts_range_s: int,
+    fanout: int,
+    max_edges: int,
+    seed: int,
+    device: torch.device,
+    k_value: int = 10,
+) -> tuple[float, float]:
+    rng = np.random.default_rng(int(seed))
+    n = int(src_id.shape[0])
+    if n == 0:
+        return float("nan"), float("nan")
+    if max_edges > 0 and n > int(max_edges):
+        idx = rng.choice(n, size=int(max_edges), replace=False)
+        src_type = src_type[idx]
+        dst_type = dst_type[idx]
+        edge_type = edge_type[idx]
+        src_id = src_id[idx]
+        dst_id = dst_id[idx]
+        ts_s = ts_s[idx]
+        n = int(src_id.shape[0])
+
+    # Convert src local -> src global for TGB neg dict.
+    src_global = np.empty((n,), dtype=np.int64)
+    for t in np.unique(src_type).tolist():
+        t_int = int(t)
+        mask = src_type == t_int
+        globals_t = globals_by_type[t_int]
+        src_global[mask] = globals_t[src_id[mask].astype(np.int64, copy=False)]
+
+    # Build negative destination local ids per row.
+    first_key = (int(ts_s[0]), int(src_global[0]), int(edge_type[0]))
+    k = len(neg_dict[first_key])
+    neg_dst_local = np.empty((n, k), dtype=np.int64)
+    for i in range(n):
+        key = (int(ts_s[i]), int(src_global[i]), int(edge_type[i]))
+        neg_g = np.asarray(neg_dict[key], dtype=np.int64)
+        # Map global dst -> local dst for the expected dst_type.
+        dt = int(dst_type[i])
+        if (node_type[neg_g] != dt).any():
+            raise RuntimeError("Negative samples contain unexpected destination node types.")
+        neg_dst_local[i, :] = local_id[neg_g].astype(np.int64, copy=False)
+
+    src_t = torch.from_numpy(src_type.astype(np.int64, copy=False)).to(device=device)
+    dst_t = torch.from_numpy(dst_type.astype(np.int64, copy=False)).to(device=device)
+    rel_t = torch.from_numpy(edge_type.astype(np.int64, copy=False)).to(device=device)
+    src = torch.from_numpy(src_id.astype(np.int64, copy=False)).to(device=device)
+    pos_dst = torch.from_numpy(dst_id.astype(np.int64, copy=False)).to(device=device)
+    neg_dst = torch.from_numpy(neg_dst_local).to(device=device)
+
+    z_src = _encode_mixed(
+        model,
+        src_t,
+        src,
+        role="src",
+        fanout=fanout,
+        rng=rng,
+        ev_arrays=ev_arrays,
+        ts_min_s=ts_min_s,
+        ts_range_s=ts_range_s,
+        device=device,
+    )
+    z_pos = _encode_mixed(
+        model,
+        dst_t,
+        pos_dst,
+        role="dst",
+        fanout=fanout,
+        rng=rng,
+        ev_arrays=ev_arrays,
+        ts_min_s=ts_min_s,
+        ts_range_s=ts_range_s,
+        device=device,
+    )
+    rel_h = model.edge_emb(rel_t)
+    pos_score = torch.einsum("bd,bd->b", z_src + rel_h, z_pos).view(-1, 1)
+
+    neg_flat = neg_dst.reshape(-1)
+    z_neg = _encode_mixed(
+        model,
+        dst_t.repeat_interleave(k),
+        neg_flat,
+        role="dst",
+        fanout=fanout,
+        rng=rng,
+        ev_arrays=ev_arrays,
+        ts_min_s=ts_min_s,
+        ts_range_s=ts_range_s,
+        device=device,
+    ).view(n, k, -1)
+    neg_score = torch.einsum("bd,bnd->bn", z_src + rel_h, z_neg)
+
+    optimistic = (neg_score > pos_score).sum(dim=1)
+    pessimistic = (neg_score >= pos_score).sum(dim=1)
+    rank = 0.5 * (optimistic.float() + pessimistic.float()) + 1.0
+    mrr = float((1.0 / rank).mean().item())
+    hits = float((rank <= float(int(k_value))).float().mean().item())
+    return mrr, hits
 
 
 class CSRAdjacency:
@@ -576,6 +802,17 @@ def main() -> None:
     parser.add_argument("--num_neg_eval", type=int, default=100)
     parser.add_argument("--max_train_edges", type=int, default=200000)
     parser.add_argument("--max_eval_edges", type=int, default=20000)
+    parser.add_argument(
+        "--eval_mode",
+        default="sampled",
+        choices=["sampled", "tgb"],
+        help="Evaluation protocol: sampled negatives vs official TGB one-vs-many (requires relbench_cache_root).",
+    )
+    parser.add_argument(
+        "--relbench_cache_root",
+        default="/home/pc0618/tmp_relbench_cache_official",
+        help="Root containing prepared rel-tgb-* cache dirs (for eval_mode=tgb).",
+    )
     parser.add_argument("--parquet_batch_size", type=int, default=500000)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--save_dir", default=None)
@@ -627,6 +864,36 @@ def main() -> None:
         dropout=float(args.dropout),
     ).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
+
+    # Optional: load official one-vs-many evaluation inputs (tasks + negatives) once.
+    val_official = None
+    test_official = None
+    val_neg = None
+    test_neg = None
+    node_type = None
+    local_id = None
+    globals_by_type = None
+    if args.eval_mode == "tgb":
+        relbench_cache_root = Path(args.relbench_cache_root)
+        node_type, local_id, globals_by_type = _load_thgl_mappings(
+            relbench_cache_root=relbench_cache_root, dataset=args.dataset
+        )
+        val_neg = _load_thgl_negatives(relbench_cache_root=relbench_cache_root, dataset=args.dataset, split="val")
+        test_neg = _load_thgl_negatives(relbench_cache_root=relbench_cache_root, dataset=args.dataset, split="test")
+        val_official = _load_official_edges_thgl(
+            relbench_cache_root=relbench_cache_root,
+            dataset=args.dataset,
+            split="val",
+            max_edges=int(args.max_eval_edges),
+            seed=int(args.seed) + 7,
+        )
+        test_official = _load_official_edges_thgl(
+            relbench_cache_root=relbench_cache_root,
+            dataset=args.dataset,
+            split="test",
+            max_edges=int(args.max_eval_edges),
+            seed=int(args.seed) + 9,
+        )
 
     steps_per_epoch = max(1, math.ceil(train_idx.shape[0] / int(args.batch_size)))
     print(f"Dataset={args.dataset} train_events={train_idx.shape[0]} node_types={len(ev_arrays.node_type_to_n)} edge_types={meta.edge_type_count} suffix={suffix}")
@@ -711,60 +978,124 @@ def main() -> None:
         avg_loss = total_loss / float(steps_per_epoch)
 
         model.eval()
-        val = _load_edges_by_time_thgl(
-            exports_root,
-            args.dataset,
-            start_s_exclusive=meta.val_timestamp_s,
-            end_s_inclusive=meta.test_timestamp_s,
-            parquet_batch_size=int(args.parquet_batch_size),
-            max_edges=int(args.max_eval_edges),
-            seed=int(args.seed) + 7,
-        )
-        val_mrr = _evaluate_mrr(
-            model,
-            ev_arrays,
-            src_type=val[0],
-            dst_type=val[1],
-            edge_type=val[2],
-            src_id=val[3],
-            dst_id=val[4],
-            ts_min_s=ts_min_s,
-            ts_range_s=ts_range_s,
-            num_neg=int(args.num_neg_eval),
-            fanout=int(args.fanout),
-            max_edges=int(args.max_eval_edges),
-            seed=int(args.seed) + 13 + epoch,
-            device=device,
-        )
-        test = _load_edges_by_time_thgl(
-            exports_root,
-            args.dataset,
-            start_s_exclusive=meta.test_timestamp_s,
-            end_s_inclusive=None,
-            parquet_batch_size=int(args.parquet_batch_size),
-            max_edges=int(args.max_eval_edges),
-            seed=int(args.seed) + 9,
-        )
-        test_mrr = _evaluate_mrr(
-            model,
-            ev_arrays,
-            src_type=test[0],
-            dst_type=test[1],
-            edge_type=test[2],
-            src_id=test[3],
-            dst_id=test[4],
-            ts_min_s=ts_min_s,
-            ts_range_s=ts_range_s,
-            num_neg=int(args.num_neg_eval),
-            fanout=int(args.fanout),
-            max_edges=int(args.max_eval_edges),
-            seed=int(args.seed) + 17 + epoch,
-            device=device,
-        )
+        if args.eval_mode == "tgb":
+            assert val_official is not None and test_official is not None
+            assert val_neg is not None and test_neg is not None
+            assert node_type is not None and local_id is not None and globals_by_type is not None
 
-        print(f"epoch={epoch} loss={avg_loss:.4f} val_mrr={val_mrr:.4f} test_mrr={test_mrr:.4f}")
-        if wb is not None:
-            wb.log({"epoch": epoch, "loss": avg_loss, "val_mrr": val_mrr, "test_mrr": test_mrr})
+            val_mrr, val_hits = _evaluate_tgb_official_thgl(
+                model,
+                ev_arrays,
+                src_type=val_official[0],
+                dst_type=val_official[1],
+                edge_type=val_official[2],
+                src_id=val_official[3],
+                dst_id=val_official[4],
+                ts_s=val_official[5],
+                neg_dict=val_neg,
+                node_type=node_type,
+                local_id=local_id,
+                globals_by_type=globals_by_type,
+                ts_min_s=ts_min_s,
+                ts_range_s=ts_range_s,
+                fanout=int(args.fanout),
+                max_edges=0,
+                seed=int(args.seed) + 13 + epoch,
+                device=device,
+                k_value=10,
+            )
+            test_mrr, test_hits = _evaluate_tgb_official_thgl(
+                model,
+                ev_arrays,
+                src_type=test_official[0],
+                dst_type=test_official[1],
+                edge_type=test_official[2],
+                src_id=test_official[3],
+                dst_id=test_official[4],
+                ts_s=test_official[5],
+                neg_dict=test_neg,
+                node_type=node_type,
+                local_id=local_id,
+                globals_by_type=globals_by_type,
+                ts_min_s=ts_min_s,
+                ts_range_s=ts_range_s,
+                fanout=int(args.fanout),
+                max_edges=0,
+                seed=int(args.seed) + 17 + epoch,
+                device=device,
+                k_value=10,
+            )
+
+            print(
+                f"epoch={epoch} loss={avg_loss:.4f} val_mrr={val_mrr:.4f} val_hits@10={val_hits:.4f} "
+                f"test_mrr={test_mrr:.4f} test_hits@10={test_hits:.4f}"
+            )
+            if wb is not None:
+                wb.log(
+                    {
+                        "epoch": epoch,
+                        "loss": avg_loss,
+                        "val_mrr": val_mrr,
+                        "val_hits@10": val_hits,
+                        "test_mrr": test_mrr,
+                        "test_hits@10": test_hits,
+                    }
+                )
+        else:
+            val = _load_edges_by_time_thgl(
+                exports_root,
+                args.dataset,
+                start_s_exclusive=meta.val_timestamp_s,
+                end_s_inclusive=meta.test_timestamp_s,
+                parquet_batch_size=int(args.parquet_batch_size),
+                max_edges=int(args.max_eval_edges),
+                seed=int(args.seed) + 7,
+            )
+            val_mrr = _evaluate_mrr(
+                model,
+                ev_arrays,
+                src_type=val[0],
+                dst_type=val[1],
+                edge_type=val[2],
+                src_id=val[3],
+                dst_id=val[4],
+                ts_min_s=ts_min_s,
+                ts_range_s=ts_range_s,
+                num_neg=int(args.num_neg_eval),
+                fanout=int(args.fanout),
+                max_edges=int(args.max_eval_edges),
+                seed=int(args.seed) + 13 + epoch,
+                device=device,
+            )
+            test = _load_edges_by_time_thgl(
+                exports_root,
+                args.dataset,
+                start_s_exclusive=meta.test_timestamp_s,
+                end_s_inclusive=None,
+                parquet_batch_size=int(args.parquet_batch_size),
+                max_edges=int(args.max_eval_edges),
+                seed=int(args.seed) + 9,
+            )
+            test_mrr = _evaluate_mrr(
+                model,
+                ev_arrays,
+                src_type=test[0],
+                dst_type=test[1],
+                edge_type=test[2],
+                src_id=test[3],
+                dst_id=test[4],
+                ts_min_s=ts_min_s,
+                ts_range_s=ts_range_s,
+                num_neg=int(args.num_neg_eval),
+                fanout=int(args.fanout),
+                max_edges=int(args.max_eval_edges),
+                seed=int(args.seed) + 17 + epoch,
+                device=device,
+            )
+
+            print(f"epoch={epoch} loss={avg_loss:.4f} val_mrr={val_mrr:.4f} test_mrr={test_mrr:.4f}")
+            if wb is not None:
+                wb.log({"epoch": epoch, "loss": avg_loss, "val_mrr": val_mrr, "test_mrr": test_mrr})
 
     if args.save_dir:
         save_dir = Path(args.save_dir)
@@ -779,4 +1110,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
