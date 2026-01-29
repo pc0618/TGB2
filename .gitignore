@@ -171,3 +171,6 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# Local experiment artifacts
+logs/

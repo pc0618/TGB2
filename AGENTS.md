@@ -233,12 +233,17 @@ db_full = ds.get_db(upto_test_timestamp=False)
 
 We prepared a PR against `snap-stanford/relbench` to add the converted TGB datasets + tasks (all non-KG families: `tgbl-*`, `tgbn-*`, `thgl-*`).
 
-RelBench repo state:
-- Repo: `/home/pc0618/relbench`
-- Branch: `add-tgb-datasets`
-- Commits:
-  - `fb07391`: add `relbench/relbench/datasets/tgb.py`, `relbench/relbench/tasks/tgb.py`, and register all `rel-tgb-*` datasets/tasks
-  - `0917ac0`: fix `thgl-github` task registrations to match actual type-pairs; switch tasks to “next” semantics; add SHA256 entries to `relbench/relbench/datasets/hashes.json` + `relbench/relbench/tasks/hashes.json`
+RelBench repo/worktree state (current):
+- PR1 (datasets/tasks + hashes): `/home/pc0618/relbench_pr1` on branch `add-tgb-datasets`
+  - Adds `rel-tgb-*` datasets and registers:
+    - `src-dst-mrr` (TGB official one-vs-many MRR/Hits@k with provided negatives)
+    - `edge-type-<id>-mrr` (same, per `events_edge_type_<id>` for `thgl-*`)
+    - `src-dst-next` / `typeX-typeY-next` (recommendation-format “next interaction” tasks; top-k precision/recall/MAP)
+    - `node-label-ndcg` for `tgbn-*`
+- PR2 (example scripts + smoke tests): `/home/pc0618/relbench` on branch `tgb2-temporal-examples`
+  - Makes `examples/tgn_attention_recommendation.py` usable on large datasets (budget caps + memory-safe update).
+  - Adds `--download/--no-download` to recommendation example scripts so they can run purely from local caches.
+  - Adds a smoke runner under `/home/pc0618/relbench_runs/`.
 
 Local zip artifacts (hosting TBD):
 - Dataset zips: `/home/pc0618/relbench_tgb_artifacts/rel-tgb-*/db.zip`
@@ -249,6 +254,18 @@ Local zip artifacts (hosting TBD):
 
 Remaining step for `relbench/CONTRIBUTING.md`:
 - Decide where to host `db.zip` and `<task>.zip` files and include the hosted links in the PR description (hashes are already computed/added).
+
+### Quick check: run RelBench TGN+attention on exported TGB data
+
+Once PR1+PR2 are in the same worktree (or by using the PR2 `examples/` scripts with PR1 `relbench/` on `PYTHONPATH`), you can run:
+
+```bash
+RELBENCH_CACHE_DIR=/home/pc0618/relbench_tgb_cache_run3 \
+  .venv/bin/python examples/tgn_attention_recommendation.py \
+    --dataset rel-tgb-tgbl-wiki-v2 --task src-dst-next --no-download \
+    --epochs 1 --batch_size 512 --max_train_events 20000 --max_history_events 20000 \
+    --max_val_rows 200 --max_test_rows 200 --device cpu
+```
 
 ### Status: Dynamic Link Property Prediction exports (`tgbl-*`)
 
@@ -280,6 +297,19 @@ Notes / caveats:
   - `tgbl-flight`: 16-dim encoded features exist in TGB (callsign/typecode encoding); currently omitted (only `weight=1.0` kept).
   - `tgbl-comment`: has additional edge features in TGB (and also appends score as part of the message); currently omitted beyond `weight`.
 - Large datasets (`tgbl-comment`, `tgbl-flight`) can be expensive to load with RelBench’s current in-memory `Database.load()` since it materializes full tables into pandas.
+
+### Baseline suite we want to standardize on (for TGB → RelBench benchmarks)
+
+- **Graph-native baseline (TGB-style)**: sampled **GraphSAGE** over the projected `src_id → dst_id` adjacency (i.e., treating `events` rows as edges for message passing), trained/evaluated from the RelBench exports.
+- **Relational baseline (RDL / RelBench-style)**: **RelEventSAGE** over the PK/FK “row-as-node” graph (treat `events` rows as nodes connected via foreign keys), trained/evaluated from the RelBench exports.
+- **Temporal attention baseline**: **TGN + attention** (our GraphAttentionEmbedding variant) run in a way that is directly comparable to the above two, ideally consuming the same RelBench-exported schema (or an equivalent deterministic cache derived from it).
+
+Exports-based TGN+attention runner (sampled-negative MRR@K) is implemented at:
+- `baselines/tgn_attention_linkpred_exports.py` (reads `relbench_exports/<dataset>/db/*.parquet` directly; handles wiki bipartite + `thgl-*` multi-table `events_edge_type_*` by combining event tables and sampling negatives per destination table).
+
+Recent 5-epoch export runs (CPU, `K=100`, `max_train_events=50k`, `max_{val,test}_events=20k`, `batch_size=96`, `mem_dim=32`, `time_dim=16`, `emb_dim=32`):
+- TGBL exports logs: `TGB2/logs/exports_tgn_attn_mrr_5ep_rerun_20260129_011938/`
+- THGL exports logs: `TGB2/logs/exports_tgn_attn_mrr_5ep_thgl_20260129_012117/`
 
 ## GCN baseline (static, link prediction)
 
@@ -453,6 +483,7 @@ To make it comparable to the RelBench baselines, we added:
 
 Run (default18, CPU):
 - `--max_train_events 200000 --max_val_events 20000 --max_test_events 20000 --eval_mode sampled --num_neg_eval 100 --num_epoch 3`
+  - For better results, try increasing to `--num_epoch 20` (early stopping still applies) and optionally tune `--lr` / `--patience`.
 
 Result (sampled-negative MRR):
 - val MRR by epoch: `0.1121`, `0.1332`, `0.1423`
@@ -460,6 +491,7 @@ Result (sampled-negative MRR):
 
 Scaled-up run (same eval; full train split, CPU):
 - `--max_train_events 0 --max_val_events 20000 --max_test_events 20000 --eval_mode sampled --num_neg_eval 100 --num_epoch 3`
+  - For better results, try increasing to `--num_epoch 20` (early stopping still applies).
 
 Result (sampled-negative MRR):
 - val MRR by epoch: `0.2494`, `0.2676`, `0.2876`
@@ -477,6 +509,8 @@ Important compatibility note (this repo’s `tgb` snapshot):
 - `tgbl-wiki-v2` / `tgbl-review-v2` are **not supported** by `PyGLinkPropPredDataset`; use `tgbl-wiki` / `tgbl-review` instead.
 
 All runs below use: `--eval_mode sampled --num_neg_eval 100 --num_epoch 3 --num_run 1 --bs 200`.
+To try to improve results, increase max epochs (early stopping still applies), e.g. `--num_epoch 20` (or `--num_epoch 30`) and optionally tune `--lr` and `--patience`.
+- Convenience wrapper (defaults to the `tgbl-*` suite): `scripts/run_linkpred_gat_long.sh [epochs=20] [dataset ...]`
 
 ### THGL (budgeted train; `max_train_events=200000`, `max_val_events=20000`, `max_test_events=20000`)
 
@@ -563,3 +597,7 @@ Notes:
 Smoke test (to validate correctness; small budget):
 - `PYTHONPATH=. .venv/bin/python baselines/graphsage_nodeprop.py --dataset tgbn-genre --model gat --epochs 1 --batch_size 512 --fanouts 5,2 --emb_dim 32 --hidden_dim 32 --num_heads 4 --num_neg_eval 50 --max_train_events 5000 --max_eval_events 1000 --adj val`
 - Result: epoch 1 val MRR `0.8248`, val NDCG@10 `0.5358`; test MRR `0.8167`, test NDCG@10 `0.5425`
+
+“Real test” (still budgeted, but closer to a real run):
+- `PYTHONPATH=. .venv/bin/python baselines/graphsage_nodeprop.py --dataset tgbn-genre --model gat --epochs 10 --batch_size 1024 --fanouts 10,5 --emb_dim 64 --hidden_dim 64 --num_heads 4 --num_neg_eval 100 --max_train_events 50000 --max_eval_events 5000 --adj val`
+- Convenience wrapper: `scripts/run_nodeprop_gat_real_test.sh [dataset=tgbn-genre] [epochs=10]`
