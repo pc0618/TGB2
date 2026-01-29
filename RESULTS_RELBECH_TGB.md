@@ -131,9 +131,11 @@ Baseline 2: **TGN + GraphAttention** on exports (combined `events_edge_type_*` s
 | `thgl-software` | 0.1388 | 0.1206 | 0.1367 | 0.1290 |
 | `thgl-forum` | 0.4635 | 0.4401 | 0.3452 | 0.3527 |
 | `thgl-myket` | 0.7264 | 0.7084 | 0.6614 | 0.6648 |
-| `thgl-github` | 0.1441* | 0.1159* | 0.0782 | 0.0767 |
+| `thgl-github` | 0.0725† | 0.0666† | 0.0782 | 0.0767 |
 
-\* `thgl-github` GraphSAGE (event-as-node) was run with a reduced budget (1 epoch, `max_train_edges=50k`, `max_eval_edges=5k`, `K=50`), so it is not strictly comparable to the other rows.
+† `thgl-github` GraphSAGE (event-as-node) re-run with standard settings to match the table heading (sampled-negative MRR@100): 3 epochs, `max_train_edges=200k`, `max_eval_edges=20k`, `K=100`, `seed=1` → val `0.0725`, test `0.0666` (best epoch by val).
+\* Prior reduced-budget run (not strictly comparable): 1 epoch, `max_train_edges=50k`, `max_eval_edges=5k`, `K=50` → val `0.1441`, test `0.1159`.
 
 Logs:
 - `TGB2/logs/exports_tgn_attn_mrr_5ep_thgl_20260129_012117/`
+- `TGB2/logs/releventsage_thgl-github_long_20260129_080231/`
