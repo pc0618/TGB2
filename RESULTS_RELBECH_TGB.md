@@ -43,7 +43,7 @@ Existing RelBench (official datasets/tasks, MAP@10-style recommendation metrics)
 
 Translated TGB → RelBench exports (apples-to-apples sampled-negative MRR@100 on `TGB2/relbench_exports/*`):
 - GraphSAGE-on-exports (projected edge graph): `TGB2/baselines/graphsage_linkpred.py`
-- RelEventSAGE-on-exports (PK/FK row-as-node relational graph):
+- GraphSAGE (event-as-node, PK/FK relational graph) on exports:
   - `TGB2/baselines/relational_eventsage_linkpred.py` for `tgbl-*`
   - `TGB2/baselines/relational_eventsage_linkpred_thgl.py` for `thgl-*`
 - TGN + GraphAttention (TransformerConv) on exports (streaming parquet, sampled-negative MRR@100):
@@ -65,17 +65,21 @@ Logs:
 
 ### B2) Translated TGB → RelBench exports: Dynamic Link Property Prediction (`tgbl-*`) (sampled-negative MRR@100)
 
-#### GraphSAGE vs RelEventSAGE (exports)
+#### GraphSAGE variants on exports (projected edges vs event-as-node PK/FK)
 
 Re-evaluated under the same protocol (`adj=val`, sampled negatives `K=100`, `max_eval=20000`):
 
-| Dataset | GraphSAGE val | GraphSAGE test | RelEventSAGE val | RelEventSAGE test |
+| Dataset | GraphSAGE (projected edges) val | GraphSAGE (projected edges) test | GraphSAGE (event-as-node) val | GraphSAGE (event-as-node) test |
 |---|---:|---:|---:|---:|
 | `tgbl-wiki-v2` | 0.4203 | 0.3782 | 0.2757 | 0.2517 |
 | `tgbl-review-v2` | 0.0932 | 0.0852 | 0.2596 | 0.2317 |
 | `tgbl-coin` | 0.4541 | 0.3932 | 0.6064 | 0.5554 |
 | `tgbl-comment` | 0.2089 | 0.1536 | 0.2896 | 0.2305 |
 | `tgbl-flight` | 0.7082 | 0.6737 | 0.6357 | 0.5915 |
+
+Notes:
+- The **GraphSAGE (event-as-node)** column is the “exported RelBench schema” **event-as-node** architecture: each `events` row is treated as a node connected to its FK endpoints (`src_id`, `dst_id`) via PK/FK links, and message passing runs over that relational graph.
+- These numbers come from the exports-based scripts listed above (`TGB2/baselines/relational_eventsage_linkpred*.py`).
 
 #### TGN + GraphAttention (TransformerConv) on exports
 
@@ -99,41 +103,19 @@ Budget/config used:
 Logs:
 - `TGB2/logs/exports_tgn_attn_mrr_5ep_rerun_20260129_011938/`
 
-#### Reference: TGN + GraphAttention on original TGB TemporalData stream (not exports)
-
-These runs use sampled-negative evaluation (K=100) but operate on the TGB TemporalData stream, not the relational exports:
-
-| Dataset | TGN+Attn val (best epoch) | TGN+Attn test |
-|---|---:|---:|
-| `tgbl-wiki` | 0.5996 | 0.5023 |
-| `tgbl-review` | 0.0882 | 0.1013 |
-| `tgbl-coin` | 0.4423 | 0.4947 |
-| `tgbl-comment` | 0.4377 | 0.3754 |
-| `tgbl-flight` | 0.5926 | 0.5563 |
-
 ### B3) Translated TGB → RelBench exports: Temporal Heterogeneous Graph Link Prediction (`thgl-*`) (sampled-negative MRR@100)
 
-Baseline 1: **RelEventSAGE** on exports (hetero PK/FK row-as-node graph).  
-Baseline 2: **TGN + GraphAttention** on original TGB TemporalData stream (type-filtered negatives by destination node type).  
-Baseline 3: **TGN + GraphAttention** on exports (combined `events_edge_type_*` stream; negatives sampled per destination table).
+Baseline 1: **GraphSAGE (event-as-node)** on exports (hetero PK/FK row-as-node graph).  
+Baseline 2: **TGN + GraphAttention** on exports (combined `events_edge_type_*` stream; negatives sampled per destination table).
 
-| Dataset | RelEventSAGE val | RelEventSAGE test | TGN+Attn (TGB stream) val | TGN+Attn (TGB stream) test |
+| Dataset | GraphSAGE (event-as-node) val | GraphSAGE (event-as-node) test | TGN+Attn exports val (best epoch) | TGN+Attn exports test |
 |---|---:|---:|---:|---:|
-| `thgl-software` | 0.1388 | 0.1206 | 0.2876 | 0.1960 |
-| `thgl-forum` | 0.4635 | 0.4401 | 0.4087 | 0.3218 |
-| `thgl-myket` | 0.7264 | 0.7084 | 0.2118 | 0.1533 |
-| `thgl-github` | 0.1441* | 0.1159* | 0.1028 | 0.0956 |
+| `thgl-software` | 0.1388 | 0.1206 | 0.1367 | 0.1290 |
+| `thgl-forum` | 0.4635 | 0.4401 | 0.3452 | 0.3527 |
+| `thgl-myket` | 0.7264 | 0.7084 | 0.6614 | 0.6648 |
+| `thgl-github` | 0.1441* | 0.1159* | 0.0782 | 0.0767 |
 
-\* `thgl-github` RelEventSAGE was run with a reduced budget (1 epoch, `max_train_edges=50k`, `max_eval_edges=5k`, `K=50`), so it is not strictly comparable to the other rows.
-
-TGN + GraphAttention (TransformerConv) on exports (same budget/config as `tgbl-*` exports table above):
-
-| Dataset | TGN+Attn exports val (best epoch) | TGN+Attn exports test |
-|---|---:|---:|
-| `thgl-software` | 0.1367 | 0.1290 |
-| `thgl-forum` | 0.3452 | 0.3527 |
-| `thgl-github` | 0.0782 | 0.0767 |
-| `thgl-myket` | 0.6614 | 0.6648 |
+\* `thgl-github` GraphSAGE (event-as-node) was run with a reduced budget (1 epoch, `max_train_edges=50k`, `max_eval_edges=5k`, `K=50`), so it is not strictly comparable to the other rows.
 
 Logs:
 - `TGB2/logs/exports_tgn_attn_mrr_5ep_thgl_20260129_012117/`
